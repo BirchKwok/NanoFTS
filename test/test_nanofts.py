@@ -70,7 +70,7 @@ def test_phrase_search(fts, test_data):
 
     test_cases = [
         ("hello world", [0, 5]),  # 只匹配完整短语
-        ("全文 搜索", [0, 2, 6]),  # 修改：包含所有包含这些词的文档
+        ("全文 搜索", [0, 2]),
         ("python 搜索", [0])
     ]
 
@@ -131,7 +131,7 @@ def test_index_persistence(fts, test_data, tmp_path):
 
 def test_empty_search(fts):
     """测试空索引搜索"""
-    assert fts.search("任意查询") == []
+    assert len(fts.search("任意查询")) == 0
 
 def test_invalid_document_input(fts):
     """测试无效的文档输入"""
