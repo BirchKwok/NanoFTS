@@ -150,3 +150,94 @@ def test_case_insensitive_search(fts, test_data):
     mixed_case = sorted(fts.search("Hello World"))
 
     assert lower_case == upper_case == mixed_case 
+
+def test_from_pandas(tmp_path):
+    """测试从pandas DataFrame导入数据"""
+    pd = pytest.importorskip("pandas")
+    
+    # 创建测试数据
+    df = pd.DataFrame({
+        'id': [1, 2, 3],
+        'title': ['Hello World', '全文搜索', 'Test Document'],
+        'content': ['This is a test', '支持多语言', 'Another test'],
+        'tags': ['test, hello', '搜索, 测试', 'doc, test']
+    })
+    
+    # 创建实例并导入数据
+    fts = FullTextSearch(index_dir=str(tmp_path / "fts_index"))
+    fts.from_pandas(df, id_column='id')
+    
+    # 测试搜索结果
+    assert sorted(fts.search("test")) == [1, 3]
+    assert sorted(fts.search("搜索")) == [2]
+    assert sorted(fts.search("hello")) == [1]
+
+def test_from_polars(tmp_path):
+    """测试从polars DataFrame导入数据"""
+    pl = pytest.importorskip("polars")
+    
+    # 创建测试数据
+    df = pl.DataFrame({
+        'id': [1, 2, 3],
+        'title': ['Hello World', '全文搜索', 'Test Document'],
+        'content': ['This is a test', '支持多语言', 'Another test'],
+        'tags': ['test, hello', '搜索, 测试', 'doc, test']
+    })
+    
+    # 创建实例并导入数据
+    fts = FullTextSearch(index_dir=str(tmp_path / "fts_index"))
+    fts.from_polars(df, id_column='id')
+    
+    # 测试搜索结果
+    assert sorted(fts.search("test")) == [1, 3]
+    assert sorted(fts.search("搜索")) == [2]
+    assert sorted(fts.search("hello")) == [1]
+
+def test_from_arrow(tmp_path):
+    """测试从pyarrow Table导入数据"""
+    pa = pytest.importorskip("pyarrow")
+    
+    # 创建测试数据
+    data = {
+        'id': [1, 2, 3],
+        'title': ['Hello World', '全文搜索', 'Test Document'],
+        'content': ['This is a test', '支持多语言', 'Another test'],
+        'tags': ['test, hello', '搜索, 测试', 'doc, test']
+    }
+    table = pa.Table.from_pydict(data)
+    
+    # 创建实例并导入数据
+    fts = FullTextSearch(index_dir=str(tmp_path / "fts_index"))
+    fts.from_arrow(table, id_column='id')
+    
+    # 测试搜索结果
+    assert sorted(fts.search("test")) == [1, 3]
+    assert sorted(fts.search("搜索")) == [2]
+    assert sorted(fts.search("hello")) == [1]
+
+def test_from_parquet(tmp_path):
+    """测试从parquet文件导入数据"""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    
+    # 创建测试数据
+    data = {
+        'id': [1, 2, 3],
+        'title': ['Hello World', '全文搜索', 'Test Document'],
+        'content': ['This is a test', '支持多语言', 'Another test'],
+        'tags': ['test, hello', '搜索, 测试', 'doc, test']
+    }
+    table = pa.Table.from_pydict(data)
+    
+    # 保存为parquet文件
+    parquet_path = tmp_path / "test.parquet"
+    pq.write_table(table, parquet_path)
+    
+    # 创建实例并导入数据
+    fts = FullTextSearch(index_dir=str(tmp_path / "fts_index"))
+    fts.from_parquet(parquet_path, id_column='id')
+    
+    # 测试搜索结果
+    assert sorted(fts.search("test")) == [1, 3]
+    assert sorted(fts.search("搜索")) == [2]
+    assert sorted(fts.search("hello")) == [1] 

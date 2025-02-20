@@ -1,5 +1,5 @@
 import re
-import mmap
+
 import shutil
 import msgpack
 from collections import defaultdict
@@ -10,56 +10,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 from pyroaring import BitMap
 
-class LRUCache:
-    """LRU缓存，用于管理内存中的活跃索引"""
-    def __init__(self, maxsize: int = 10000):
-        self.cache = {}
-        self.maxsize = maxsize
-        self.hits = defaultdict(int)
-    
-    def get(self, key: str) -> BitMap:
-        if key in self.cache:
-            self.hits[key] += 1
-            return self.cache[key]
-        return None
-    
-    def put(self, key: str, value: BitMap):
-        if len(self.cache) >= self.maxsize:
-            # 移除最少使用的项
-            lru_key = min(self.hits.items(), key=lambda x: x[1])[0]
-            del self.cache[lru_key]
-            del self.hits[lru_key]
-        self.cache[key] = value
-        self.hits[key] = 1
+from nanofts.lru import LRUCache
 
-class IndexFile:
-    """索引文件管理器，使用内存映射优化读取性能"""
-    def __init__(self, file_path: Path):
-        self.file_path = file_path
-        self.mmap = None
-        self.index_meta = {}  # 存储索引项的位置和大小
-        self._load()
-    
-    def _load(self):
-        if self.file_path.exists():
-            with open(self.file_path, 'rb') as f:
-                # 读取元数据
-                meta_size = int.from_bytes(f.read(4), 'big')
-                meta_data = f.read(meta_size)
-                self.index_meta = msgpack.unpackb(meta_data, raw=False)
-                # 内存映射数据部分
-                self.mmap = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-    
-    def get_bitmap(self, key: str) -> BitMap:
-        """获取指定键的 BitMap"""
-        if key in self.index_meta:
-            offset, size = self.index_meta[key]
-            return BitMap.deserialize(self.mmap[offset:offset + size])
-        return None
-    
-    def close(self):
-        if self.mmap:
-            self.mmap.close()
 
 class FullTextSearch:
     def __init__(self, index_dir: str = None, 
@@ -512,92 +464,155 @@ class FullTextSearch:
         # 清除缓存
         self.cache = LRUCache(maxsize=self.cache.maxsize)
 
-if __name__ == '__main__':
-    # 示例数据：文档列表，每个文档是一个字典
-    data = [
-        {"title": "Hello World", "content": "Python 全文搜索器"},
-        {"title": "GitHub Copilot", "content": "代码自动生成"},
-        {"title": "全文搜索", "content": "支持多语言", "tags": "测试数据"},
-        {"title": "hello", "content": "WORLD", "number": 123},
-        {"title": "数据处理", "content": "搜索引擎"},
-        {"title": "hello world", "content": "示例文本"},
-        {"title": "混合文本", "content": "Mixed 全文内容测试"},
-        {"title": "hello world 你好", "content": "示例文本"},
-    ]
-    
-    # 使用磁盘索引，并设置合适的参数
-    index_dir = "fts_index"
-    fts = FullTextSearch(
-        index_dir=index_dir,
-        batch_size=1000,
-        buffer_size=5000,
-        drop_if_exists=True  # 清除已存在的索引
-    )
-    
-    # 批量添加文档
-    doc_ids = list(range(len(data)))
-    fts.add_document(doc_ids, data)
-    fts.flush()
-    
-    # 基本搜索测试
-    print("\n=== 基本搜索测试 ===")
-    
-    # 测试精确匹配
-    print("\n精确匹配测试:")
-    queries = ["Hello World", "hello world", "全文搜索", "mixed"]
-    for query in queries:
-        result = fts.search(query)
-        print(f"查询【{query}】的文档: {result}")
-        if result:
-            print("匹配的文档内容:")
-            for doc_id in result:
-                print(f"  - {data[doc_id]}")
-    
-    # 测试中文查询
-    print("\n中文查询测试:")
-    queries = ["全文", "搜索", "测试"]
-    for query in queries:
-        result = fts.search(query)
-        print(f"查询【{query}】的文档: {result}")
-        if result:
-            print("匹配的文档内容:")
-            for doc_id in result:
-                print(f"  - {data[doc_id]}")
-    
-    # 测试词组查询
-    print("\n词组查询测试:")
-    queries = ["hello world", "全文 搜索", "python 搜索"]
-    for query in queries:
-        result = fts.search(query)
-        print(f"查询【{query}】的文档: {result}")
-        if result:
-            print("匹配的文档内容:")
-            for doc_id in result:
-                print(f"  - {data[doc_id]}")
-    
-    # 增量更新测试
-    print("\n=== 增量更新测试 ===")
-    new_doc = {"title": "新增文档", "content": "测试全文搜索", "tags": "hello world test"}
-    fts.add_document(len(data), new_doc)
-    fts.flush()
-    
-    print("\n添加新文档后:")
-    queries = ["新增", "测试", "hello world"]
-    for query in queries:
-        result = fts.search(query)
-        print(f"查询【{query}】的文档: {result}")
-    
-    # 删除文档
-    fts.remove_document(len(data))
-    print("\n删除新文档后:")
-    for query in queries:
-        result = fts.search(query)
-        print(f"查询【{query}】的文档: {result}")
-    
-    # 从磁盘加载索引
-    print("\n=== 重新加载索引测试 ===")
-    fts_reload = FullTextSearch(index_dir=index_dir)
-    for query in ["hello world", "全文", "搜索"]:
-        result = fts_reload.search(query)
-        print(f"查询【{query}】的文档: {result}")
-    
+    def from_pandas(self, df, id_column=None, text_columns=None):
+        """
+        从pandas DataFrame导入数据。
+
+        Args:
+            df: pandas DataFrame对象
+            id_column: 文档ID列名，如果为None则使用行索引
+            text_columns: 要索引的文本列名列表，如果为None则使用所有object和string类型的列
+        """
+        try:
+            import pandas as pd
+        except ImportError:
+            raise ImportError("使用from_pandas需要安装pandas，请执行: pip install nanofts[pandas]")
+
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError("df必须是pandas DataFrame对象")
+
+        # 获取文档ID
+        if id_column is None:
+            doc_ids = df.index.tolist()
+        else:
+            doc_ids = df[id_column].tolist()
+
+        # 获取要索引的列
+        if text_columns is None:
+            text_columns = df.select_dtypes(include=['object', 'string']).columns.tolist()
+        
+        # 构建文档列表
+        docs = []
+        for _, row in df[text_columns].iterrows():
+            doc = {col: str(val) for col, val in row.items() if pd.notna(val)}
+            docs.append(doc)
+
+        # 添加文档并刷新
+        self.add_document(doc_ids, docs)
+        self.flush()
+
+    def from_polars(self, df, id_column=None, text_columns=None):
+        """
+        从polars DataFrame导入数据。
+
+        Args:
+            df: polars DataFrame对象
+            id_column: 文档ID列名，如果为None则使用行索引
+            text_columns: 要索引的文本列名列表，如果为None则使用所有Utf8类型的列
+        """
+        try:
+            import polars as pl
+        except ImportError:
+            raise ImportError("使用from_polars需要安装polars，请执行: pip install nanofts[polars]")
+
+        if not isinstance(df, pl.DataFrame):
+            raise TypeError("df必须是polars DataFrame对象")
+
+        # 获取文档ID
+        if id_column is None:
+            doc_ids = list(range(len(df)))
+        else:
+            doc_ids = df[id_column].to_list()
+
+        # 获取要索引的列
+        if text_columns is None:
+            text_columns = [col for col in df.columns if df[col].dtype == pl.Utf8]
+
+        # 构建文档列表
+        docs = []
+        for row in df.select(text_columns).iter_rows():
+            doc = {col: str(val) for col, val in zip(text_columns, row) if val is not None}
+            docs.append(doc)
+
+        # 添加文档并刷新
+        self.add_document(doc_ids, docs)
+        self.flush()
+
+    def from_arrow(self, table, id_column=None, text_columns=None):
+        """
+        从pyarrow Table导入数据。
+
+        Args:
+            table: pyarrow Table对象
+            id_column: 文档ID列名，如果为None则使用行索引
+            text_columns: 要索引的文本列名列表，如果为None则使用所有string类型的列
+        """
+        try:
+            import pyarrow as pa
+        except ImportError:
+            raise ImportError("使用from_arrow需要安装pyarrow，请执行: pip install nanofts[pyarrow]")
+
+        if not isinstance(table, pa.Table):
+            raise TypeError("table必须是pyarrow Table对象")
+
+        # 获取文档ID
+        if id_column is None:
+            doc_ids = list(range(len(table)))
+        else:
+            doc_ids = table[id_column].to_pylist()
+
+        # 获取要索引的列
+        if text_columns is None:
+            text_columns = [field.name for field in table.schema 
+                           if pa.types.is_string(field.type)]
+            if id_column in text_columns:
+                text_columns.remove(id_column)
+
+        # 构建文档列表
+        table_dict = table.select(text_columns).to_pydict()
+        docs = []
+        for i in range(len(table)):
+            doc = {}
+            for col in text_columns:
+                val = table_dict[col][i]
+                if val is not None:
+                    doc[col] = str(val)
+            docs.append(doc)
+
+        # 添加文档并刷新
+        self.add_document(doc_ids, docs)
+        self.flush()
+
+    def from_parquet(self, path, id_column=None, text_columns=None):
+        """
+        从parquet文件导入数据。
+
+        Args:
+            path: parquet文件路径
+            id_column: 文档ID列名，如果为None则使用行索引
+            text_columns: 要索引的文本列名列表，如果为None则使用所有string类型的列
+        """
+        try:
+            import pyarrow.parquet as pq
+        except ImportError:
+            raise ImportError("使用from_parquet需要安装pyarrow，请执行: pip install nanofts[pyarrow]")
+
+        table = pq.read_table(path)
+        self.from_arrow(table, id_column, text_columns)
+
+    def from_csv(self, path, id_column=None, text_columns=None):
+        """
+        从csv文件导入数据。
+
+        Args:
+            path: csv文件路径
+            id_column: 文档ID列名，如果为None则使用行索引
+            text_columns: 要索引的文本列名列表，如果为None则使用所有string类型的列
+        """
+        try:
+            import pandas as pd
+        except ImportError:
+            raise ImportError("使用from_csv需要安装pandas，请执行: pip install nanofts[pandas]")
+        
+        df = pd.read_csv(path)
+        self.from_pandas(df, id_column, text_columns)
