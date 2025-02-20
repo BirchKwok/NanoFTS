@@ -86,8 +86,8 @@ class FullTextSearch:
         for term, bitmap in self.index.items():
             if len(term) < self.min_term_length:  # 跳过过短的词
                 continue
-            doc_ids = sorted(bitmap)
-            for doc_id in doc_ids:
+            # 直接遍历 bitmap，无需排序，因为 bitmap 本身就是有序的
+            for doc_id in bitmap:
                 shard_id = doc_id // self.shard_size
                 if term not in shards[shard_id]:
                     shards[shard_id][term] = BitMap()
@@ -370,7 +370,7 @@ class FullTextSearch:
         # 使用缓存获取结果
         cached_result = self.cache.get(query_key)
         if cached_result is not None:
-            return sorted(cached_result)
+            return list(cached_result)  # BitMap已经是有序的，直接转换为列表
 
         result = BitMap()
         
@@ -378,7 +378,7 @@ class FullTextSearch:
         if query_key in self.index:
             result |= self.index[query_key]
             self.cache.put(query_key, result)
-            return sorted(result)
+            return list(result)  # 直接转换为列表，无需排序
         
         # 检查是否为中文查询
         if self.chinese_pattern.search(query_key):
@@ -390,7 +390,7 @@ class FullTextSearch:
                         result |= self.index[substr]
                         if result:  # 如果找到匹配，就返回
                             self.cache.put(query_key, result)
-                            return sorted(result)
+                            return list(result)  # 直接转换为列表
         else:
             # 非中文查询：词组匹配
             if ' ' in query_key:
@@ -416,7 +416,7 @@ class FullTextSearch:
 
         # 缓存结果
         self.cache.put(query_key, result)
-        return sorted(result)
+        return list(result)  # 直接转换为列表，无需排序
 
     def _bitmap_to_bytes(self, bitmap: BitMap) -> bytes:
         """将 BitMap 转换为字节串"""
@@ -500,7 +500,6 @@ class FullTextSearch:
         # 添加文档并刷新
         self.add_document(doc_ids, docs)
         self.flush()
-
     def from_polars(self, df, id_column=None, text_columns=None):
         """
         从polars DataFrame导入数据。
@@ -616,3 +615,4 @@ class FullTextSearch:
         
         df = pd.read_csv(path)
         self.from_pandas(df, id_column, text_columns)
+
