@@ -241,3 +241,28 @@ def test_from_parquet(tmp_path):
     assert sorted(fts.search("test")) == [1, 3]
     assert sorted(fts.search("搜索")) == [2]
     assert sorted(fts.search("hello")) == [1] 
+
+def test_from_csv(tmp_path):
+    """测试从csv文件导入数据"""
+    pd = pytest.importorskip("pandas")
+    
+    # 创建测试数据
+    df = pd.DataFrame({
+        'id': [1, 2, 3],
+        'title': ['Hello World', '全文搜索', 'Test Document'],
+        'content': ['This is a test', '支持多语言', 'Another test'],
+        'tags': ['test, hello', '搜索, 测试', 'doc, test']
+    })
+    
+    # 保存为csv文件 
+    csv_path = tmp_path / "test.csv"
+    df.to_csv(csv_path, index=False)
+    
+    # 创建实例并导入数据
+    fts = FullTextSearch(index_dir=str(tmp_path / "fts_index"))
+    fts.from_csv(csv_path, id_column='id')
+
+    # 测试搜索结果
+    assert sorted(fts.search("test")) == [1, 3]
+    assert sorted(fts.search("搜索")) == [2]
+    assert sorted(fts.search("hello")) == [1]   
