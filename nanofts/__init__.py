@@ -5,7 +5,6 @@ import shutil
 from typing import List, Union, Dict
 from pathlib import Path
 
-from nanofts.lru import LRUCache
 from nanofts.index import InvertedIndex
 from nanofts.inserter import DocumentInserter
 
@@ -64,9 +63,6 @@ class FullTextSearch:
             shard_size=shard_size
         )
         
-        # 查询缓存
-        self.cache = LRUCache(maxsize=10000)
-        
         # 批处理计数器
         self._batch_count = 0
         
@@ -93,7 +89,6 @@ class FullTextSearch:
         self.inverted_index.remove_document(doc_id)
         if self.index_dir:
             self.inverted_index.save(doc_id // self.shard_size, incremental=True)
-        self.cache = LRUCache(maxsize=self.cache.maxsize)
 
     def from_pandas(self, df, id_column=None, text_columns=None):
         """从pandas DataFrame导入数据"""
