@@ -8,27 +8,29 @@ from pyroaring import BitMap
 from functools import lru_cache
 import xxhash
 
+from .base import BaseIndex
 
-class InvertedIndex:
+
+class InvertedIndex(BaseIndex):
     """倒排索引实现"""
     
     def __init__(self, 
-                 index_dir: Path = None,
+                 index_dir: Optional[Path] = None,
                  max_chinese_length: int = 4,
                  min_term_length: int = 2,
                  buffer_size: int = 100000,
-                 shard_bits: int = 8,  # 新增分片位数参数
-                 cache_size: int = 1000):  # 新增缓存大小参数
+                 shard_bits: int = 8,
+                 cache_size: int = 1000):
         """
-        初始化倒排索引。
+        初始化倒排索引
         
         Args:
             index_dir: 索引文件存储目录
-            max_chinese_length: 中文子串的最大长度
-            min_term_length: 最小词长度
+            max_chinese_length: 中文子串最大长度
+            min_term_length: 最小词条长度
             buffer_size: 内存缓冲区大小
-            shard_bits: 分片位数,决定分片数量(2^shard_bits)
-            cache_size: LRU缓存大小
+            shard_bits: 分片位数
+            cache_size: 缓存大小
         """
         self.index_dir = index_dir
         self.max_chinese_length = max_chinese_length
@@ -39,7 +41,6 @@ class InvertedIndex:
         self.modified_keys = set()
         
         # 主索引和缓冲区
-        self.index = None  # 不再全局加载
         self.word_index = defaultdict(BitMap)
         self.index_buffer = defaultdict(BitMap)
         
@@ -62,11 +63,11 @@ class InvertedIndex:
         self._bitmap_cache = get_bitmap
 
     def _get_shard_id(self, term: str) -> int:
-        """计算term的分片ID"""
+        """计算词条的分片ID"""
         return xxhash.xxh32(term.encode()).intdigest() & (self.shard_count - 1)
 
     def _load_term_bitmap(self, term: str, shard_id: int) -> Optional[BitMap]:
-        """从磁盘加载指定term的bitmap"""
+        """从磁盘加载词条的位图"""
         if not self.index_dir:
             return None
             
@@ -91,7 +92,7 @@ class InvertedIndex:
             return None
 
     def add_terms(self, doc_id: int, terms: Dict[str, Union[str, int, float]]) -> None:
-        """添加文档的词条到索引"""
+        """添加文档词条到索引"""
         for field_value in terms.values():
             field_str = str(field_value).lower()
             
@@ -125,133 +126,8 @@ class InvertedIndex:
         if len(self.index_buffer) >= self.buffer_size:
             self.merge_buffer()
 
-    def merge_buffer(self) -> None:
-        """合并缓冲区到磁盘"""
-        if not self.index_buffer:
-            return
-            
-        # 按分片分组
-        sharded_buffer = defaultdict(lambda: defaultdict(BitMap))
-        for term, bitmap in self.index_buffer.items():
-            shard_id = self._get_shard_id(term)
-            sharded_buffer[shard_id][term] = bitmap
-        
-        # 分片写入
-        for shard_id, terms in sharded_buffer.items():
-            self._merge_shard(shard_id, terms)
-        
-        # 清空buffer
-        self.index_buffer.clear()
-        # 清空缓存
-        self._bitmap_cache.cache_clear()
-
-    def _merge_shard(self, shard_id: int, terms: Dict[str, BitMap]) -> None:
-        """合并单个分片的数据"""
-        shard_path = self.index_dir / 'shards' / f'shard_{shard_id}.apex'
-        
-        # 读取现有数据
-        existing_meta = {}
-        existing_data = {}
-        if shard_path.exists():
-            with open(shard_path, 'rb') as f:
-                meta_size = int.from_bytes(f.read(4), 'big')
-                meta_data = f.read(meta_size)
-                existing_meta = msgpack.unpackb(meta_data, raw=False)
-                
-                for term, (offset, size) in existing_meta.items():
-                    f.seek(4 + meta_size + offset)
-                    bitmap_data = f.read(size)
-                    existing_data[term] = bitmap_data
-        
-        # 合并数据
-        new_data = {}
-        new_meta = {}
-        offset = 0
-        
-        for term, bitmap_data in existing_data.items():
-            if term in terms:  # 需要更新
-                bitmap = BitMap.deserialize(bitmap_data)
-                bitmap |= terms[term]
-                bitmap_data = bitmap.serialize()
-                del terms[term]
-            
-            new_data[term] = bitmap_data
-            new_meta[term] = (offset, len(bitmap_data))
-            offset += len(bitmap_data)
-        
-        # 添加新terms
-        for term, bitmap in terms.items():
-            bitmap_data = bitmap.serialize()
-            new_data[term] = bitmap_data
-            new_meta[term] = (offset, len(bitmap_data))
-            offset += len(bitmap_data)
-        
-        # 保存
-        if new_data:
-            shard_path.parent.mkdir(exist_ok=True)
-            with open(shard_path, 'wb') as f:
-                meta_data = msgpack.packb(new_meta, use_bin_type=True)
-                f.write(len(meta_data).to_bytes(4, 'big'))
-                f.write(meta_data)
-                for bitmap_data in new_data.values():
-                    f.write(bitmap_data)
-
-    def build_word_index(self) -> None:
-        """构建词组索引"""
-        if not self.index_dir:
-            return
-        
-        temp_word_index = defaultdict(set)
-        shards_dir = self.index_dir / 'shards'
-        
-        # 从所有分片中读取数据
-        if shards_dir.exists():
-            for shard_path in shards_dir.glob('*.apex'):
-                try:
-                    with open(shard_path, 'rb') as f:
-                        meta_size = int.from_bytes(f.read(4), 'big')
-                        meta_data = f.read(meta_size)
-                        meta = msgpack.unpackb(meta_data, raw=False)
-                        
-                        for term, (offset, size) in meta.items():
-                            if ' ' in term:  # 只处理包含空格的词组
-                                f.seek(4 + meta_size + offset)
-                                bitmap_data = f.read(size)
-                                bitmap = BitMap.deserialize(bitmap_data)
-                                
-                                # 处理词组中的单词
-                                words = term.split()
-                                doc_ids = list(bitmap)
-                                for word in words:
-                                    if not self.chinese_pattern.search(word) and len(word) >= self.min_term_length:
-                                        temp_word_index[word].update(doc_ids)
-                except Exception as e:
-                    print(f"处理分片 {shard_path} 时出错: {e}")
-                    continue
-        
-        # 处理缓冲区中的数据
-        for term, bitmap in self.index_buffer.items():
-            if ' ' in term:
-                words = term.split()
-                doc_ids = list(bitmap)
-                for word in words:
-                    if not self.chinese_pattern.search(word) and len(word) >= self.min_term_length:
-                        temp_word_index[word].update(doc_ids)
-        
-        # 转换为BitMap并保存
-        self.word_index.clear()
-        for word, doc_ids in temp_word_index.items():
-            if doc_ids:
-                self.word_index[word] = BitMap(doc_ids)
-        
-        # 保存词组索引
-        if self.index_dir:
-            word_dir = self.index_dir / 'word'
-            word_dir.mkdir(exist_ok=True)
-            self._save_shard(self.word_index, word_dir / "index.apex", False)
-
     def search(self, query: str) -> BitMap:
-        """搜索查询词"""
+        """搜索查询"""
         # 快速路径 - 直接返回
         query = query.strip().lower()
         if not query:
@@ -360,7 +236,7 @@ class InvertedIndex:
         return BitMap()
 
     def remove_document(self, doc_id: int) -> None:
-        """从索引中删除文档"""
+        """从索引中移除文档"""
         if not self.index_dir:
             return
         
@@ -441,8 +317,79 @@ class InvertedIndex:
         # 清空缓存
         self._bitmap_cache.cache_clear()
 
-    def save(self, shard_id: int, incremental: bool = True) -> None:
-        """保存索引分片"""
+    def merge_buffer(self) -> None:
+        """合并缓冲区"""
+        if not self.index_buffer:
+            return
+            
+        # 按分片分组
+        sharded_buffer = defaultdict(lambda: defaultdict(BitMap))
+        for term, bitmap in self.index_buffer.items():
+            shard_id = self._get_shard_id(term)
+            sharded_buffer[shard_id][term] = bitmap
+        
+        # 分片写入
+        for shard_id, terms in sharded_buffer.items():
+            self._merge_shard(shard_id, terms)
+        
+        # 清空buffer
+        self.index_buffer.clear()
+        # 清空缓存
+        self._bitmap_cache.cache_clear()
+
+    def _merge_shard(self, shard_id: int, terms: Dict[str, BitMap]) -> None:
+        """合并单个分片的数据"""
+        shard_path = self.index_dir / 'shards' / f'shard_{shard_id}.apex'
+        
+        # 读取现有数据
+        existing_meta = {}
+        existing_data = {}
+        if shard_path.exists():
+            with open(shard_path, 'rb') as f:
+                meta_size = int.from_bytes(f.read(4), 'big')
+                meta_data = f.read(meta_size)
+                existing_meta = msgpack.unpackb(meta_data, raw=False)
+                
+                for term, (offset, size) in existing_meta.items():
+                    f.seek(4 + meta_size + offset)
+                    bitmap_data = f.read(size)
+                    existing_data[term] = bitmap_data
+        
+        # 合并数据
+        new_data = {}
+        new_meta = {}
+        offset = 0
+        
+        for term, bitmap_data in existing_data.items():
+            if term in terms:  # 需要更新
+                bitmap = BitMap.deserialize(bitmap_data)
+                bitmap |= terms[term]
+                bitmap_data = bitmap.serialize()
+                del terms[term]
+            
+            new_data[term] = bitmap_data
+            new_meta[term] = (offset, len(bitmap_data))
+            offset += len(bitmap_data)
+        
+        # 添加新terms
+        for term, bitmap in terms.items():
+            bitmap_data = bitmap.serialize()
+            new_data[term] = bitmap_data
+            new_meta[term] = (offset, len(bitmap_data))
+            offset += len(bitmap_data)
+        
+        # 保存
+        if new_data:
+            shard_path.parent.mkdir(exist_ok=True)
+            with open(shard_path, 'wb') as f:
+                meta_data = msgpack.packb(new_meta, use_bin_type=True)
+                f.write(len(meta_data).to_bytes(4, 'big'))
+                f.write(meta_data)
+                for bitmap_data in new_data.values():
+                    f.write(bitmap_data)
+
+    def save(self, incremental: bool = True) -> None:
+        """保存索引"""
         if not self.index_dir:
             return
             
@@ -460,7 +407,13 @@ class InvertedIndex:
             self.modified_keys.clear()
 
     def _save_shard(self, shard_data: Dict[str, BitMap], shard_path: Path, incremental: bool) -> None:
-        """保存单个分片"""
+        """保存单个分片
+        
+        Args:
+            shard_data: 分片数据
+            shard_path: 分片路径
+            incremental: 是否增量保存
+        """
         if not shard_data:
             if shard_path.exists():
                 shard_path.unlink()
@@ -540,7 +493,12 @@ class InvertedIndex:
             return False
 
     def _load_shard(self, shard_path: Path, is_word_index: bool = False) -> None:
-        """加载单个分片"""
+        """加载单个分片
+        
+        Args:
+            shard_path: 分片路径
+            is_word_index: 是否是词组索引
+        """
         if not shard_path.exists():
             return
             
@@ -567,3 +525,57 @@ class InvertedIndex:
                 
         except Exception as e:
             print(f"加载分片 {shard_path} 时出错: {e}")
+
+    def build_word_index(self) -> None:
+        """构建词组索引"""
+        if not self.index_dir:
+            return
+        
+        temp_word_index = defaultdict(set)
+        shards_dir = self.index_dir / 'shards'
+        
+        # 从所有分片中读取数据
+        if shards_dir.exists():
+            for shard_path in shards_dir.glob('*.apex'):
+                try:
+                    with open(shard_path, 'rb') as f:
+                        meta_size = int.from_bytes(f.read(4), 'big')
+                        meta_data = f.read(meta_size)
+                        meta = msgpack.unpackb(meta_data, raw=False)
+                        
+                        for term, (offset, size) in meta.items():
+                            if ' ' in term:  # 只处理包含空格的词组
+                                f.seek(4 + meta_size + offset)
+                                bitmap_data = f.read(size)
+                                bitmap = BitMap.deserialize(bitmap_data)
+                                
+                                # 处理词组中的单词
+                                words = term.split()
+                                doc_ids = list(bitmap)
+                                for word in words:
+                                    if not self.chinese_pattern.search(word) and len(word) >= self.min_term_length:
+                                        temp_word_index[word].update(doc_ids)
+                except Exception as e:
+                    print(f"处理分片 {shard_path} 时出错: {e}")
+                    continue
+        
+        # 处理缓冲区中的数据
+        for term, bitmap in self.index_buffer.items():
+            if ' ' in term:
+                words = term.split()
+                doc_ids = list(bitmap)
+                for word in words:
+                    if not self.chinese_pattern.search(word) and len(word) >= self.min_term_length:
+                        temp_word_index[word].update(doc_ids)
+        
+        # 转换为BitMap并保存
+        self.word_index.clear()
+        for word, doc_ids in temp_word_index.items():
+            if doc_ids:
+                self.word_index[word] = BitMap(doc_ids)
+        
+        # 保存词组索引
+        if self.index_dir:
+            word_dir = self.index_dir / 'word'
+            word_dir.mkdir(exist_ok=True)
+            self._save_shard(self.word_index, word_dir / "index.apex", False) 
