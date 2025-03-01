@@ -4,7 +4,7 @@ from pathlib import Path
 from pyroaring import BitMap
 
 class BaseIndex(ABC):
-    """索引的抽象基类"""
+    """Base class for all indexes"""
     
     @abstractmethod
     def __init__(self, 
@@ -15,49 +15,49 @@ class BaseIndex(ABC):
                  shard_bits: int = 8,
                  cache_size: int = 1000):
         """
-        初始化索引
+        Initialize the index
         
         Args:
-            index_dir: 索引文件存储目录
-            max_chinese_length: 中文子串最大长度
-            min_term_length: 最小词条长度
-            buffer_size: 内存缓冲区大小
-            shard_bits: 分片位数
-            cache_size: 缓存大小
+            index_dir: The directory to store the index files
+            max_chinese_length: The maximum length of Chinese substrings
+            min_term_length: The minimum length of terms
+            buffer_size: The size of the memory buffer
+            shard_bits: The number of bits for the shard
+            cache_size: The size of the cache
         """
         pass
 
     @abstractmethod
     def add_terms(self, doc_id: int, terms: Dict[str, Union[str, int, float]]) -> None:
-        """添加文档词条到索引"""
+        """Add terms to the index"""
         pass
 
     @abstractmethod
     def search(self, query: str, score_threshold: Optional[float] = None) -> Union[BitMap, List[tuple[int, float]]]:
-        """搜索查询"""
+        """Search for a query"""
         pass
 
     @abstractmethod
     def remove_document(self, doc_id: int) -> None:
-        """从索引中移除文档"""
+        """Remove a document from the index"""
         pass
 
     @abstractmethod
     def merge_buffer(self) -> None:
-        """合并缓冲区"""
+        """Merge the buffer"""
         pass
 
     @abstractmethod
     def save(self, incremental: bool = True) -> None:
-        """保存索引"""
+        """Save the index"""
         pass
 
     @abstractmethod
     def load(self) -> bool:
-        """加载索引"""
+        """Load the index"""
         pass
 
     @abstractmethod
     def build_word_index(self) -> None:
-        """构建词组索引"""
+        """Build the word index"""
         pass 

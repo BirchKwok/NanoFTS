@@ -22,20 +22,20 @@ class FullTextSearch:
                  index_type: str = "inverted",
                  ngram_size: int = 2):
         """
-        初始化全文搜索引擎
+        Initialize the full-text search engine
 
         Args:
-            index_dir: 索引文件存储目录，如果为None则使用内存索引
-            max_chinese_length: 中文子串最大长度，默认为4
-            num_workers: 并行索引的工作线程数，默认为8
-            shard_size: 每个分片的文档数，默认为500,000
-            min_term_length: 最小词条长度，默认为2
-            auto_save: 是否自动保存到磁盘，默认为True
-            batch_size: 每批处理的文档数，默认为10000
-            drop_if_exists: 如果索引文件存在是否删除，默认为False
-            buffer_size: 内存缓冲区大小，默认为100000
-            index_type: 索引类型，可选值：inverted、ngram，默认为inverted
-            ngram_size: n-gram大小，仅用于NGram索引，默认为2
+            index_dir (str): The directory to store the index files, if None, use in-memory index
+            max_chinese_length (int): The maximum length of Chinese substrings, default is 4
+            num_workers (int): The number of worker threads for parallel indexing, default is 8
+            shard_size (int): The number of documents per shard, default is 500,000
+            min_term_length (int): The minimum length of a term, default is 2
+            auto_save (bool): Whether to save to disk automatically, default is True
+            batch_size (int): The number of documents to process in each batch, default is 10000
+            drop_if_exists (bool): Whether to delete the index files if they exist, default is False
+            buffer_size (int): The size of the memory buffer, default is 100000
+            index_type (str): The type of index, optional values: inverted, ngram, default is inverted
+            ngram_size (int): The size of the n-gram, only used for NGram index, default is 2
         """
         self.chinese_pattern = re.compile(r'[\u4e00-\u9fff]+')
         self.index_dir = Path(index_dir) if index_dir else None
@@ -51,11 +51,10 @@ class FullTextSearch:
         self.batch_size = batch_size
         self.buffer_size = buffer_size
         
-        # 创建索引实例
         try:
             index_type_enum = IndexType(index_type)
         except ValueError:
-            raise ValueError(f"不支持的索引类型: {index_type}")
+            raise ValueError(f"Unsupported index type: {index_type}")
             
         self.inverted_index = IndexFactory.create_index(
             index_type=index_type_enum,
@@ -66,7 +65,6 @@ class FullTextSearch:
             ngram_size=ngram_size
         )
         
-        # 初始化插入器
         self.inserter = DocumentInserter(
             index=self.inverted_index,
             num_workers=num_workers,
@@ -74,7 +72,6 @@ class FullTextSearch:
             shard_size=shard_size
         )
         
-        # 批处理计数器
         self._batch_count = 0
         
         if self.index_dir:
@@ -84,85 +81,106 @@ class FullTextSearch:
     def add_document(self, doc_id: Union[int, List[int]], 
                     fields: Union[Dict[str, Union[str, int, float]], 
                                 List[Dict[str, Union[str, int, float]]]]):
-        """添加文档到索引
+        """Add documents to the index
         
         Args:
-            doc_id: 文档ID或ID列表
-            fields: 要索引的字段
+            doc_id: The document ID or a list of document IDs
+            fields: The fields to index
         """
         self.inserter.add_documents(doc_id, fields)
 
     def search(self, query: str) -> Union[BitMap, List[tuple[int, float]]]:
-        """搜索查询
+        """Search for a query
         
         Args:
-            query: 要搜索的查询
+            query: The query to search for
         Returns:
-            Union[BitMap, List[tuple[int, float]]]: 文档ID集合或(文档ID, 相似度)列表
+            Union[BitMap, List[tuple[int, float]]]: The document ID set or a list of (document ID, similarity)
         """
         return self.inverted_index.search(query)
 
     def flush(self):
-        """刷新缓冲区并保存到磁盘"""
+        """Flush the buffer and save to disk"""
         self.inserter.flush()
 
     def remove_document(self, doc_id: int):
-        """从索引中移除文档
+        """Remove a document from the index
         
         Args:
-            doc_id: 要移除的文档ID
+            doc_id: The document ID to remove
         """
         self.inverted_index.remove_document(doc_id)
         if self.index_dir:
             self.inverted_index.save(incremental=True)
 
-    def from_pandas(self, df, id_column=None, text_columns=None):
-        """从pandas DataFrame导入数据
+    def update_document(self, doc_id: int, 
+                       fields: Union[Dict[str, Union[str, int, float]], 
+                       List[Dict[str, Union[str, int, float]]]]):
+        """Update a document in the index
         
         Args:
-            df: pandas DataFrame对象
-            id_column: 文档ID列名，如果为None则使用行索引
-            text_columns: 要索引的文本列列表，如果为None则使用所有字符串列
+            doc_id: The document ID to update
+            fields: The fields to update
+        """
+        self.inserter.update_document(doc_id, fields)
+
+    def batch_update_document(self, doc_ids: List[int], 
+                             fields: List[Dict[str, Union[str, int, float]]]):
+        """批量更新多个文档
+        
+        Args:
+            doc_ids: 文档ID列表，例如 [1, 2, 3]
+            fields: 文档字段列表，与doc_ids一一对应，例如 [{"title": "doc1"}, {"title": "doc2"}, {"title": "doc3"}]
+        """
+        self.inserter.batch_update_document(doc_ids, fields)
+
+    def from_pandas(self, df, id_column=None, text_columns=None):
+        """Import data from a pandas DataFrame
+        
+        Args:
+            df: pandas DataFrame object
+            id_column: The name of the document ID column, if None, use the row index
+            text_columns: The list of text columns to index, if None, use all string columns
         """
         self.inserter.from_pandas(df, id_column, text_columns)
 
     def from_polars(self, df, id_column=None, text_columns=None):
-        """从polars DataFrame导入数据
+        """Import data from a polars DataFrame
         
         Args:
-            df: polars DataFrame对象
-            id_column: 文档ID列名，如果为None则使用行索引
-            text_columns: 要索引的文本列列表，如果为None则使用所有字符串列
+            df: polars DataFrame object
+            id_column: The name of the document ID column, if None, use the row index
+            text_columns: The list of text columns to index, if None, use all string columns
         """
         self.inserter.from_polars(df, id_column, text_columns)
 
     def from_arrow(self, table, id_column=None, text_columns=None):
-        """从pyarrow Table导入数据
+        """Import data from a pyarrow Table
         
         Args:
-            table: pyarrow Table对象
-            id_column: 文档ID列名，如果为None则使用行索引
-            text_columns: 要索引的文本列列表，如果为None则使用所有字符串列
+            table: pyarrow Table object
+            id_column: The name of the document ID column, if None, use the row index
+            text_columns: The list of text columns to index, if None, use all string columns
         """
         self.inserter.from_arrow(table, id_column, text_columns)
 
     def from_parquet(self, path, id_column=None, text_columns=None):
-        """从parquet文件导入数据
+        """Import data from a parquet file
         
         Args:
-            path: parquet文件路径
-            id_column: 文档ID列名，如果为None则使用行索引
-            text_columns: 要索引的文本列列表，如果为None则使用所有字符串列
+            path: The path to the parquet file
+            id_column: The name of the document ID column, if None, use the row index
+            text_columns: The list of text columns to index, if None, use all string columns
         """
         self.inserter.from_parquet(path, id_column, text_columns)
 
     def from_csv(self, path, id_column=None, text_columns=None):
-        """从CSV文件导入数据
+        """Import data from a CSV file
         
         Args:
-            path: CSV文件路径
-            id_column: 文档ID列名，如果为None则使用行索引
-            text_columns: 要索引的文本列列表，如果为None则使用所有字符串列
+            path: The path to the CSV file
+            id_column: The name of the document ID column, if None, use the row index
+            text_columns: The list of text columns to index, if None, use all string columns
         """
         self.inserter.from_csv(path, id_column, text_columns)
 

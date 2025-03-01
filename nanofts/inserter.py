@@ -75,6 +75,32 @@ class DocumentInserter:
         if self._batch_count >= self.batch_size * 4:
             self.flush()
 
+    def update_document(self, 
+                       doc_id: int, 
+                       fields: Union[Dict[str, Union[str, int, float]], 
+                       List[Dict[str, Union[str, int, float]]]]):
+        """Update a document in the index
+        
+        Args:
+            doc_id: The document ID to update
+            fields: The fields to update
+        """
+        self.index.update_terms(doc_id, fields)
+
+    def batch_update_document(self, 
+                             doc_ids: List[int], 
+                             fields: List[Dict[str, Union[str, int, float]]]):
+        """批量更新多个文档
+        
+        Args:
+            doc_ids: 文档ID列表
+            fields: 文档字段列表，与doc_ids一一对应
+        """
+        if len(doc_ids) != len(fields):
+            raise ValueError("文档ID列表和文档字段列表长度不匹配")
+            
+        self.index.batch_update_terms(doc_ids, fields)
+
     def flush(self) -> None:
         """Flush the buffer and save"""
         self.index.merge_buffer()

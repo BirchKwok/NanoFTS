@@ -6,12 +6,12 @@ from .inverted import InvertedIndex
 
 
 class IndexType(Enum):
-    """索引类型枚举"""
-    INVERTED = "inverted"  # 倒排索引
+    """Index type enum"""
+    INVERTED = "inverted"  # Inverted index
 
 
 class IndexFactory:
-    """索引工厂类"""
+    """Index factory class"""
     
     @staticmethod
     def create_index(index_type: IndexType,
@@ -23,18 +23,18 @@ class IndexFactory:
                     cache_size: int = 1000,
                     **kwargs) -> InvertedIndex:
         """
-        创建索引实例
+        Create an index instance
         
         Args:
-            index_type: 索引类型
-            index_dir: 索引文件存储目录
-            max_chinese_length: 中文子串最大长度
-            min_term_length: 最小词条长度
-            buffer_size: 内存缓冲区大小
-            shard_bits: 分片位数
-            cache_size: 缓存大小
-            ngram_size: n-gram大小，仅用于NGram索引
-            **kwargs: 其他参数
+            index_type: The index type
+            index_dir: The directory to store the index files
+            max_chinese_length: The maximum length of Chinese substrings
+            min_term_length: The minimum length of terms
+            buffer_size: The size of the memory buffer
+            shard_bits: The number of bits for the shard
+            cache_size: The size of the cache
+            ngram_size: The size of the n-gram, only used for NGram index
+            **kwargs: Other parameters
         """
         index_dir_path = Path(index_dir) if index_dir else None
         
@@ -48,4 +48,4 @@ class IndexFactory:
                 cache_size=cache_size
             )
         else:
-            raise ValueError(f"不支持的索引类型: {index_type}") 
+            raise ValueError(f"Unsupported index type: {index_type}") 
