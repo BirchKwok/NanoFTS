@@ -101,6 +101,16 @@ class DocumentInserter:
             
         self.index.batch_update_terms(doc_ids, fields)
 
+    def batch_remove_document(self, doc_ids: List[int]):
+        """批量删除多个文档
+        
+        Args:
+            doc_ids: 要删除的文档ID列表
+        """
+        self.index.batch_remove_document(doc_ids)
+        if self.index.index_dir:
+            self.index.save(incremental=True)
+
     def flush(self) -> None:
         """Flush the buffer and save"""
         self.index.merge_buffer()

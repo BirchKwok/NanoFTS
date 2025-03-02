@@ -943,3 +943,110 @@ class InvertedIndex(BaseIndex):
             word_dir = self.index_dir / 'word'
             word_dir.mkdir(exist_ok=True)
             self._save_shard(self.word_index, word_dir / "index.apex", False) 
+
+    def batch_remove_document(self, doc_ids: List[int]) -> None:
+        """批量删除多个文档
+        
+        Args:
+            doc_ids: 要删除的文档ID列表
+        """
+        if not doc_ids:
+            return
+            
+        if not self.index_dir:
+            return
+            
+        # 从缓冲区中删除
+        keys_to_remove = []
+        for key, bitmap in self.index_buffer.items():
+            modified = False
+            for doc_id in doc_ids:
+                if doc_id in bitmap:
+                    bitmap.discard(doc_id)
+                    modified = True
+            
+            if modified:
+                self.modified_keys.add(key)
+                if not bitmap:
+                    keys_to_remove.append(key)
+        
+        for key in keys_to_remove:
+            del self.index_buffer[key]
+        
+        # 从分片文件中删除
+        shards_dir = self.index_dir / 'shards'
+        if shards_dir.exists():
+            # 按分片分组，减少文件I/O
+            sharded_updates = defaultdict(set)
+            
+            # 收集所有需要更新的分片
+            for shard_path in shards_dir.glob('*.apex'):
+                try:
+                    with open(shard_path, 'rb') as f:
+                        meta_size = int.from_bytes(f.read(4), 'big')
+                        meta_data = f.read(meta_size)
+                        meta = msgpack.unpackb(meta_data, raw=False)
+                        
+                        modified = False
+                        new_data = {}
+                        new_meta = {}
+                        offset = 0
+                        
+                        # 处理每个词条
+                        for term, (term_offset, size) in meta.items():
+                            f.seek(4 + meta_size + term_offset)
+                            bitmap_data = f.read(size)
+                            bitmap = BitMap.deserialize(bitmap_data)
+                            
+                            term_modified = False
+                            for doc_id in doc_ids:
+                                if doc_id in bitmap:
+                                    bitmap.discard(doc_id)
+                                    term_modified = True
+                            
+                            if term_modified:
+                                modified = True
+                                self.modified_keys.add(term)
+                                
+                            if bitmap:  # 只保存非空位图
+                                bitmap_data = bitmap.serialize()
+                                new_data[term] = bitmap_data
+                                new_meta[term] = (offset, len(bitmap_data))
+                                offset += len(bitmap_data)
+                        
+                        # 如果有修改，重写分片文件
+                        if modified:
+                            if new_data:
+                                with open(shard_path, 'wb') as f:
+                                    meta_data = msgpack.packb(new_meta, use_bin_type=True)
+                                    f.write(len(meta_data).to_bytes(4, 'big'))
+                                    f.write(meta_data)
+                                    for bitmap_data in new_data.values():
+                                        f.write(bitmap_data)
+                            else:
+                                # 如果分片为空，删除文件
+                                shard_path.unlink()
+                                
+                except Exception as e:
+                    print(f"Error processing shard {shard_path}: {e}")
+                    continue
+        
+        # 从词索引中删除
+        keys_to_remove = []
+        for key, bitmap in self.word_index.items():
+            modified = False
+            for doc_id in doc_ids:
+                if doc_id in bitmap:
+                    bitmap.discard(doc_id)
+                    modified = True
+            
+            if modified:
+                self.modified_keys.add(key)
+                if not bitmap:
+                    keys_to_remove.append(key)
+        
+        for key in keys_to_remove:
+            del self.word_index[key]
+        
+        # 清理缓存
+        self._bitmap_cache.cache_clear() 

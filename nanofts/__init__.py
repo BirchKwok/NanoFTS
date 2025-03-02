@@ -113,6 +113,14 @@ class FullTextSearch:
         if self.index_dir:
             self.inverted_index.save(incremental=True)
 
+    def batch_remove_document(self, doc_ids: List[int]):
+        """批量删除多个文档
+        
+        Args:
+            doc_ids: 要删除的文档ID列表，例如 [1, 2, 3]
+        """
+        self.inserter.batch_remove_document(doc_ids)
+
     def update_document(self, doc_id: int, 
                        fields: Union[Dict[str, Union[str, int, float]], 
                        List[Dict[str, Union[str, int, float]]]]):

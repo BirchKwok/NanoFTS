@@ -410,3 +410,61 @@ def test_batch_update_document(fts, test_data):
     
     # 验证新内容已添加
     assert len(fts.search("更新的批量内容")) == 50  # 新内容已添加
+
+def test_batch_remove_document(fts, test_data):
+    """测试批量删除文档功能"""
+    # 添加初始测试数据
+    doc_ids = list(range(len(test_data)))
+    fts.add_document(doc_ids, test_data)
+    fts.flush()
+    
+    # 初始搜索验证
+    assert sorted(fts.search("hello world")) == [0, 5]
+    assert sorted(fts.search("全文搜索")) == [0, 2]
+    assert sorted(fts.search("github")) == [1]
+    
+    # 批量删除文档 0, 1, 5
+    fts.batch_remove_document([0, 1, 5])
+    fts.flush()
+    
+    # 验证文档已被删除
+    assert sorted(fts.search("hello world")) == [3, 7]  # 文档 0 和 5 已删除，但文档 3 和 7 仍然匹配
+    assert sorted(fts.search("全文搜索")) == [2]  # 文档 0 已删除
+    assert sorted(fts.search("github")) == []  # 文档 1 已删除
+    
+    # 验证未删除的文档仍然可搜索
+    assert sorted(fts.search("测试数据")) == [2]
+    assert sorted(fts.search("world")) == [3, 7]  # 文档 3 和 7 仍然包含 "world"
+    
+    # 测试批量删除的性能优势 - 同时删除多个文档
+    large_batch = []
+    large_ids = list(range(100, 150))
+    
+    for i in range(50):
+        large_batch.append({
+            "title": f"Batch Doc {i}",
+            "content": f"批量文档内容 {i}",
+            "tags": f"tag{i}"
+        })
+    
+    # 批量添加
+    fts.add_document(large_ids, large_batch)
+    fts.flush()
+    
+    # 验证添加成功
+    assert len(fts.search("批量文档内容")) == 50
+    
+    # 批量删除一半文档
+    fts.batch_remove_document(large_ids[:25])
+    fts.flush()
+    
+    # 验证删除成功
+    assert len(fts.search("批量文档内容")) == 25  # 只剩下一半文档
+    
+    # 验证特定文档已删除
+    for i in range(25):
+        assert len(fts.search(f"批量文档内容 {i}")) == 0  # 前25个文档应该已被删除
+    
+    # 验证剩余文档仍可搜索
+    for i in range(25, 50):
+        assert len(fts.search(f"批量文档内容 {i}")) == 1  # 后25个文档应该仍然存在
