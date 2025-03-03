@@ -81,11 +81,21 @@ class FullTextSearch:
     def add_document(self, doc_id: Union[int, List[int]], 
                     fields: Union[Dict[str, Union[str, int, float]], 
                                 List[Dict[str, Union[str, int, float]]]]):
-        """Add documents to the index
+        """添加一个或多个文档到索引
         
         Args:
-            doc_id: The document ID or a list of document IDs
-            fields: The fields to index
+            doc_id: 单个文档ID或文档ID列表
+            fields: 单个文档的字段或文档字段列表，与doc_id一一对应
+            
+        Examples:
+            # 添加单个文档
+            fts.add_document(1, {"title": "doc1", "content": "content1"})
+            
+            # 批量添加多个文档
+            fts.add_document([1, 2], [
+                {"title": "doc1", "content": "content1"},
+                {"title": "doc2", "content": "content2"}
+            ])
         """
         self.inserter.add_documents(doc_id, fields)
 
@@ -103,44 +113,50 @@ class FullTextSearch:
         """Flush the buffer and save to disk"""
         self.inserter.flush()
 
-    def remove_document(self, doc_id: int):
-        """Remove a document from the index
+    def remove_document(self, doc_id: Union[int, List[int]]):
+        """从索引中删除一个或多个文档
         
         Args:
-            doc_id: The document ID to remove
+            doc_id: 单个文档ID或要删除的文档ID列表
+            
+        Examples:
+            # 删除单个文档
+            fts.remove_document(1)
+            
+            # 批量删除多个文档
+            fts.remove_document([1, 2, 3])
         """
-        self.inverted_index.remove_document(doc_id)
+        if isinstance(doc_id, int):
+            self.inverted_index.remove_document(doc_id)
+        else:
+            self.inverted_index.batch_remove_document(doc_id)
+            
         if self.index_dir:
             self.inverted_index.save(incremental=True)
 
-    def batch_remove_document(self, doc_ids: List[int]):
-        """批量删除多个文档
-        
-        Args:
-            doc_ids: 要删除的文档ID列表，例如 [1, 2, 3]
-        """
-        self.inserter.batch_remove_document(doc_ids)
-
-    def update_document(self, doc_id: int, 
+    def update_document(self, doc_id: Union[int, List[int]], 
                        fields: Union[Dict[str, Union[str, int, float]], 
-                       List[Dict[str, Union[str, int, float]]]]):
-        """Update a document in the index
+                                  List[Dict[str, Union[str, int, float]]]]):
+        """更新一个或多个文档
         
         Args:
-            doc_id: The document ID to update
-            fields: The fields to update
+            doc_id: 单个文档ID或文档ID列表
+            fields: 单个文档的更新字段或文档字段列表，与doc_id一一对应
+            
+        Examples:
+            # 更新单个文档
+            fts.update_document(1, {"title": "new title", "content": "new content"})
+            
+            # 批量更新多个文档
+            fts.update_document([1, 2], [
+                {"title": "new title 1", "content": "new content 1"},
+                {"title": "new title 2", "content": "new content 2"}
+            ])
         """
-        self.inserter.update_document(doc_id, fields)
-
-    def batch_update_document(self, doc_ids: List[int], 
-                             fields: List[Dict[str, Union[str, int, float]]]):
-        """批量更新多个文档
-        
-        Args:
-            doc_ids: 文档ID列表，例如 [1, 2, 3]
-            fields: 文档字段列表，与doc_ids一一对应，例如 [{"title": "doc1"}, {"title": "doc2"}, {"title": "doc3"}]
-        """
-        self.inserter.batch_update_document(doc_ids, fields)
+        if isinstance(doc_id, int):
+            self.inserter.update_document(doc_id, fields)
+        else:
+            self.inserter.batch_update_document(doc_id, fields)
 
     def from_pandas(self, df, id_column=None, text_columns=None):
         """Import data from a pandas DataFrame

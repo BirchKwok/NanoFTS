@@ -354,7 +354,7 @@ def test_batch_update_document(fts, test_data):
     ]
     
     # 更新文档 0, 1, 5
-    fts.batch_update_document([0, 1, 5], updated_docs)
+    fts.update_document([0, 1, 5], updated_docs)
     fts.flush()
     
     # 验证旧词条已被删除
@@ -399,7 +399,7 @@ def test_batch_update_document(fts, test_data):
             "tags": f"updated{i}"
         })
     
-    fts.batch_update_document(large_ids, updated_batch)
+    fts.update_document(large_ids, updated_batch)
     fts.flush()
     
     # 验证更新成功 - 使用更具体的搜索词
@@ -424,7 +424,7 @@ def test_batch_remove_document(fts, test_data):
     assert sorted(fts.search("github")) == [1]
     
     # 批量删除文档 0, 1, 5
-    fts.batch_remove_document([0, 1, 5])
+    fts.remove_document([0, 1, 5])
     fts.flush()
     
     # 验证文档已被删除
@@ -455,7 +455,7 @@ def test_batch_remove_document(fts, test_data):
     assert len(fts.search("批量文档内容")) == 50
     
     # 批量删除一半文档
-    fts.batch_remove_document(large_ids[:25])
+    fts.remove_document(large_ids[:25])
     fts.flush()
     
     # 验证删除成功
