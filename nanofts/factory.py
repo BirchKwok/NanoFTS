@@ -33,7 +33,6 @@ class IndexFactory:
             buffer_size: The size of the memory buffer
             shard_bits: The number of bits for the shard
             cache_size: The size of the cache
-            ngram_size: The size of the n-gram, only used for NGram index
             **kwargs: Other parameters
         """
         index_dir_path = Path(index_dir) if index_dir else None

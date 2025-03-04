@@ -19,8 +19,7 @@ class FullTextSearch:
                  batch_size: int = 10000,
                  drop_if_exists: bool = False,
                  buffer_size: int = 100000,
-                 index_type: str = "inverted",
-                 ngram_size: int = 2):
+                 index_type: str = "inverted"):
         """
         Initialize the full-text search engine
 
@@ -34,8 +33,7 @@ class FullTextSearch:
             batch_size (int): The number of documents to process in each batch, default is 10000
             drop_if_exists (bool): Whether to delete the index files if they exist, default is False
             buffer_size (int): The size of the memory buffer, default is 100000
-            index_type (str): The type of index, optional values: inverted, ngram, default is inverted
-            ngram_size (int): The size of the n-gram, only used for NGram index, default is 2
+            index_type (str): The type of index, optional values: inverted, default is inverted
         """
         self.chinese_pattern = re.compile(r'[\u4e00-\u9fff]+')
         self.index_dir = Path(index_dir) if index_dir else None
@@ -61,8 +59,7 @@ class FullTextSearch:
             index_dir=index_dir,
             max_chinese_length=max_chinese_length,
             min_term_length=min_term_length,
-            buffer_size=buffer_size,
-            ngram_size=ngram_size
+            buffer_size=buffer_size
         )
         
         self.inserter = DocumentInserter(
