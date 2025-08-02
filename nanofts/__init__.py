@@ -18,7 +18,9 @@ class FullTextSearch:
                  auto_save: bool = True,
                  batch_size: int = 10000,
                  drop_if_exists: bool = False,
-                 buffer_size: int = 100000):
+                 buffer_size: int = 100000,
+                 fuzzy_threshold: float = 0.7,
+                 fuzzy_max_distance: int = 2):
         """
         Initialize the full-text search engine
 
@@ -32,6 +34,8 @@ class FullTextSearch:
             batch_size (int): The number of documents to process in each batch, default is 10000
             drop_if_exists (bool): Whether to delete the index files if they exist, default is False
             buffer_size (int): The size of the memory buffer, default is 100000
+            fuzzy_threshold (float): The similarity threshold for fuzzy search (0.0-1.0), default is 0.7
+            fuzzy_max_distance (int): The maximum edit distance for fuzzy search, default is 2
         """
         self.chinese_pattern = re.compile(r'[\u4e00-\u9fff]+')
         self.index_dir = Path(index_dir) if index_dir else None
@@ -46,6 +50,8 @@ class FullTextSearch:
         self.auto_save = auto_save
         self.batch_size = batch_size
         self.buffer_size = buffer_size
+        self.fuzzy_threshold = fuzzy_threshold
+        self.fuzzy_max_distance = fuzzy_max_distance
         
         index_type_enum = IndexType("inverted")
             
@@ -54,7 +60,9 @@ class FullTextSearch:
             index_dir=index_dir,
             max_chinese_length=max_chinese_length,
             min_term_length=min_term_length,
-            buffer_size=buffer_size
+            buffer_size=buffer_size,
+            fuzzy_threshold=fuzzy_threshold,
+            fuzzy_max_distance=fuzzy_max_distance
         )
         
         self.inserter = DocumentInserter(
@@ -91,15 +99,40 @@ class FullTextSearch:
         """
         self.inserter.add_documents(doc_id, fields)
 
-    def search(self, query: str) -> Union[BitMap, List[tuple[int, float]]]:
+    def search(self, query: str, enable_fuzzy: bool = False, min_results: int = 5) -> Union[BitMap, List[tuple[int, float]]]:
         """Search for a query
         
         Args:
             query: The query to search for
+            enable_fuzzy: Whether to enable fuzzy search, default is False
+            min_results: Minimum number of results before enabling fuzzy search, default is 5
+            
+        Returns:
+            Union[BitMap, List[tuple[int, float]]]: The document ID set or a list of (document ID, similarity)
+            
+        Examples:
+            # 精确搜索
+            results = fts.search("搜索查询")
+            
+            # 启用模糊搜索
+            results = fts.search("搜索查询", enable_fuzzy=True)
+            
+            # 设置最小结果数阈值
+            results = fts.search("搜索查询", enable_fuzzy=True, min_results=10)
+        """
+        return self.inverted_index.search(query, enable_fuzzy=enable_fuzzy, min_results=min_results)
+
+    def fuzzy_search(self, query: str, min_results: int = 5) -> Union[BitMap, List[tuple[int, float]]]:
+        """便捷的模糊搜索方法
+        
+        Args:
+            query: The query to search for
+            min_results: Minimum number of results before enabling fuzzy search, default is 5
+            
         Returns:
             Union[BitMap, List[tuple[int, float]]]: The document ID set or a list of (document ID, similarity)
         """
-        return self.inverted_index.search(query)
+        return self.search(query, enable_fuzzy=True, min_results=min_results)
 
     def flush(self):
         """Flush the buffer and save to disk"""
@@ -199,4 +232,30 @@ class FullTextSearch:
             text_columns: The list of text columns to index, if None, use all string columns
         """
         self.inserter.from_csv(path, id_column, text_columns)
+
+    def get_fuzzy_config(self) -> Dict[str, Union[float, int]]:
+        """获取模糊搜索配置
+        
+        Returns:
+            Dict containing fuzzy search configuration
+        """
+        return {
+            "fuzzy_threshold": self.fuzzy_threshold,
+            "fuzzy_max_distance": self.fuzzy_max_distance
+        }
+
+    def set_fuzzy_config(self, fuzzy_threshold: float = None, fuzzy_max_distance: int = None):
+        """设置模糊搜索配置
+        
+        Args:
+            fuzzy_threshold: The similarity threshold for fuzzy search (0.0-1.0)
+            fuzzy_max_distance: The maximum edit distance for fuzzy search
+        """
+        if fuzzy_threshold is not None:
+            self.fuzzy_threshold = fuzzy_threshold
+            self.inverted_index.fuzzy_threshold = fuzzy_threshold
+            
+        if fuzzy_max_distance is not None:
+            self.fuzzy_max_distance = fuzzy_max_distance
+            self.inverted_index.fuzzy_max_distance = fuzzy_max_distance
 

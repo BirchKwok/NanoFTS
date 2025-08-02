@@ -2,7 +2,7 @@ import re
 import msgpack
 from pathlib import Path
 from collections import defaultdict
-from typing import Dict, Union, Optional, List
+from typing import Dict, Union, Optional, List, Tuple
 
 from pyroaring import BitMap
 from functools import lru_cache
@@ -20,7 +20,9 @@ class InvertedIndex(BaseIndex):
                  min_term_length: int = 2,
                  buffer_size: int = 100000,
                  shard_bits: int = 8,
-                 cache_size: int = 1000):
+                 cache_size: int = 1000,
+                 fuzzy_threshold: float = 0.7,
+                 fuzzy_max_distance: int = 2):
         """
         Initialize the inverted index
         
@@ -31,6 +33,8 @@ class InvertedIndex(BaseIndex):
             buffer_size: The size of the memory buffer
             shard_bits: The number of bits for the shard
             cache_size: The size of the cache
+            fuzzy_threshold: The similarity threshold for fuzzy search (0.0-1.0)
+            fuzzy_max_distance: The maximum edit distance for fuzzy search
         """
         self.index_dir = index_dir
         self.max_chinese_length = max_chinese_length
@@ -51,14 +55,32 @@ class InvertedIndex(BaseIndex):
         self.shard_count = 1 << shard_bits
         self.cache_size = cache_size
         
+        # Fuzzy search parameters
+        self.fuzzy_threshold = fuzzy_threshold
+        self.fuzzy_max_distance = fuzzy_max_distance
+        self._fuzzy_cache = {}  # Cache for fuzzy search results
+        self._term_cache = None  # Cache for all terms, built on demand
+        
         self._init_cache()
 
     def _init_cache(self) -> None:
         """Initialize the LRU cache"""
         @lru_cache(maxsize=self.cache_size)
         def get_bitmap(term: str) -> Optional[BitMap]:
-            shard_id = self._get_shard_id(term)
-            return self._load_term_bitmap(term, shard_id)
+            # 首先检查缓冲区
+            if term in self.index_buffer:
+                return self.index_buffer[term].copy()
+            
+            # 检查内存索引（内存模式）
+            if term in self.word_index:
+                return self.word_index[term].copy()
+            
+            # 如果是磁盘模式，从磁盘加载
+            if self.index_dir:
+                shard_id = self._get_shard_id(term)
+                return self._load_term_bitmap(term, shard_id)
+            
+            return None
         
         self._bitmap_cache = get_bitmap
 
@@ -71,7 +93,7 @@ class InvertedIndex(BaseIndex):
         if not self.index_dir:
             return None
             
-        shard_path = self.index_dir / 'shards' / f'shard_{shard_id}.apex'
+        shard_path = self.index_dir / 'shards' / f'shard_{shard_id}.nfts'
         if not shard_path.exists():
             return None
             
@@ -125,8 +147,118 @@ class InvertedIndex(BaseIndex):
         # Merge the buffer when it reaches the threshold
         if len(self.index_buffer) >= self.buffer_size:
             self.merge_buffer()
+        
+        # 无效化词条缓存，因为添加了新词条
+        self._invalidate_term_cache()
 
-    def search(self, query: str) -> BitMap:
+    @staticmethod
+    def _levenshtein_distance(s1: str, s2: str) -> int:
+        """计算两个字符串的编辑距离（Levenshtein距离）"""
+        if len(s1) < len(s2):
+            s1, s2 = s2, s1
+        
+        if len(s2) == 0:
+            return len(s1)
+        
+        previous_row = list(range(len(s2) + 1))
+        for i, c1 in enumerate(s1):
+            current_row = [i + 1]
+            for j, c2 in enumerate(s2):
+                insertions = previous_row[j + 1] + 1
+                deletions = current_row[j] + 1
+                substitutions = previous_row[j] + (c1 != c2)
+                current_row.append(min(insertions, deletions, substitutions))
+            previous_row = current_row
+        
+        return previous_row[-1]
+
+    @staticmethod
+    def _similarity_score(s1: str, s2: str) -> float:
+        """计算两个字符串的相似度分数 (0.0-1.0)"""
+        if not s1 and not s2:
+            return 1.0
+        if not s1 or not s2:
+            return 0.0
+        
+        distance = InvertedIndex._levenshtein_distance(s1, s2)
+        max_len = max(len(s1), len(s2))
+        return 1.0 - (distance / max_len)
+
+    def _get_all_terms(self) -> set:
+        """获取所有索引中的词条，用于模糊搜索"""
+        if self._term_cache is not None:
+            return self._term_cache
+        
+        terms = set()
+        
+        # 从缓冲区获取词条
+        terms.update(self.index_buffer.keys())
+        
+        # 从内存索引获取词条（内存模式）
+        terms.update(self.word_index.keys())
+        
+        # 从磁盘分片获取词条（如果存在）
+        if self.index_dir and (self.index_dir / 'shards').exists():
+            shards_dir = self.index_dir / 'shards'
+            for shard_path in shards_dir.glob('*.nfts'):
+                try:
+                    with open(shard_path, 'rb') as f:
+                        meta_size = int.from_bytes(f.read(4), 'big')
+                        meta_data = f.read(meta_size)
+                        meta = msgpack.unpackb(meta_data, raw=False)
+                        terms.update(meta.keys())
+                except:
+                    continue
+        
+        # 缓存结果
+        self._term_cache = terms
+        return terms
+
+    def _invalidate_term_cache(self):
+        """无效化词条缓存，在索引更新时调用"""
+        self._term_cache = None
+
+    def _fuzzy_search_terms(self, query: str, max_results: int = 20) -> List[Tuple[str, float]]:
+        """在所有词条中进行模糊搜索，返回相似词条和相似度分数"""
+        cache_key = f"{query}:{max_results}"
+        if cache_key in self._fuzzy_cache:
+            return self._fuzzy_cache[cache_key]
+        
+        all_terms = self._get_all_terms()
+        candidates = []
+        
+        # 过滤长度相近的词条以提高效率
+        query_len = len(query)
+        max_len_diff = self.fuzzy_max_distance
+        
+        for term in all_terms:
+            # 跳过长度差异过大的词条
+            if abs(len(term) - query_len) > max_len_diff:
+                continue
+            
+            # 快速预过滤：如果完全没有共同字符，跳过
+            if not set(query) & set(term):
+                continue
+            
+            similarity = self._similarity_score(query, term)
+            if similarity >= self.fuzzy_threshold:
+                candidates.append((term, similarity))
+        
+        # 按相似度降序排序，取前max_results个
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        result = candidates[:max_results]
+        
+        # 缓存结果（限制缓存大小）
+        if len(self._fuzzy_cache) > 1000:
+            # 清理最旧的一半缓存
+            oldest_keys = list(self._fuzzy_cache.keys())[:500]
+            for key in oldest_keys:
+                del self._fuzzy_cache[key]
+        
+        self._fuzzy_cache[cache_key] = result
+        return result
+
+    def search(self, query: str, enable_fuzzy: bool = False, min_results: int = 5) -> BitMap:
         """Search for a query"""
         # Quick path - return directly
         query = query.strip().lower()
@@ -189,6 +321,7 @@ class InvertedIndex(BaseIndex):
             return result
         
         # 3. Chinese query optimization
+        exact_result = None
         if self.chinese_pattern.search(query):
             n = len(query)
             if n < self.min_term_length:
@@ -203,7 +336,8 @@ class InvertedIndex(BaseIndex):
                 result = self._bitmap_cache(substr)
                 if result is not None:
                     if len(result) < 1000:  # Return the result when it is small
-                        return result
+                        exact_result = result
+                        break
                     # Save the first match result
                     first_match = result
                     
@@ -214,7 +348,8 @@ class InvertedIndex(BaseIndex):
                         if prev_docs is not None:
                             temp = result & prev_docs
                             if temp:
-                                return temp
+                                exact_result = temp
+                                break
                     
                     if i < n - max_len:
                         next_substr = query[i+1:i+1+max_len]
@@ -222,18 +357,48 @@ class InvertedIndex(BaseIndex):
                         if next_docs is not None:
                             temp = result & next_docs
                             if temp:
-                                return temp
+                                exact_result = temp
+                                break
                     
-                    return first_match
+                    exact_result = first_match
+                    break
             
             # 3.3 Fall back to the minimum length match
-            for i in range(n - self.min_term_length + 1):
-                substr = query[i:i + self.min_term_length]
-                result = self._bitmap_cache(substr)
-                if result is not None:
-                    return result
+            if exact_result is None:
+                for i in range(n - self.min_term_length + 1):
+                    substr = query[i:i + self.min_term_length]
+                    result = self._bitmap_cache(substr)
+                    if result is not None:
+                        exact_result = result
+                        break
         
-        return BitMap()
+        # 4. 模糊搜索（仅在启用且精确搜索结果不足时）
+        if enable_fuzzy and (exact_result is None or len(exact_result) < min_results):
+            fuzzy_result = self._perform_fuzzy_search(query)
+            
+            if exact_result is None:
+                return fuzzy_result
+            elif len(exact_result) < min_results and len(fuzzy_result) > 0:
+                # 合并精确搜索和模糊搜索的结果
+                return exact_result | fuzzy_result
+        
+        return exact_result if exact_result is not None else BitMap()
+
+    def _perform_fuzzy_search(self, query: str) -> BitMap:
+        """执行模糊搜索并返回合并的结果"""
+        similar_terms = self._fuzzy_search_terms(query)
+        if not similar_terms:
+            return BitMap()
+        
+        # 合并所有相似词条的结果
+        result = BitMap()
+        for term, similarity in similar_terms:
+            term_result = self._bitmap_cache(term)
+            if term_result is not None:
+                # 可以根据相似度加权，但为了性能简单起见，直接合并
+                result |= term_result
+        
+        return result
 
     def remove_document(self, doc_id: int) -> None:
         """Remove the document from the index"""
@@ -255,7 +420,7 @@ class InvertedIndex(BaseIndex):
         # Remove from the shards
         shards_dir = self.index_dir / 'shards'
         if shards_dir.exists():
-            for shard_path in shards_dir.glob('*.apex'):
+            for shard_path in shards_dir.glob('*.nfts'):
                 try:
                     # Read the shard data
                     with open(shard_path, 'rb') as f:
@@ -331,7 +496,7 @@ class InvertedIndex(BaseIndex):
         if self.index_dir:
             shards_dir = self.index_dir / 'shards'
             if shards_dir.exists():
-                for shard_path in shards_dir.glob('*.apex'):
+                for shard_path in shards_dir.glob('*.nfts'):
                     try:
                         with open(shard_path, 'rb') as f:
                             meta_size = int.from_bytes(f.read(4), 'big')
@@ -406,7 +571,7 @@ class InvertedIndex(BaseIndex):
             # 从分片文件中删除
             if self.index_dir:
                 shard_id = self._get_shard_id(term)
-                shard_path = self.index_dir / 'shards' / f'shard_{shard_id}.apex'
+                shard_path = self.index_dir / 'shards' / f'shard_{shard_id}.nfts'
                 if shard_path.exists():
                     try:
                         with open(shard_path, 'rb') as f:
@@ -486,7 +651,7 @@ class InvertedIndex(BaseIndex):
         if self.index_dir:
             shards_dir = self.index_dir / 'shards'
             if shards_dir.exists():
-                for shard_path in shards_dir.glob('*.apex'):
+                for shard_path in shards_dir.glob('*.nfts'):
                     try:
                         with open(shard_path, 'rb') as f:
                             meta_size = int.from_bytes(f.read(4), 'big')
@@ -602,7 +767,7 @@ class InvertedIndex(BaseIndex):
         # 4. 更新分片文件
         if self.index_dir:
             for shard_id, terms in sharded_updates.items():
-                shard_path = self.index_dir / 'shards' / f'shard_{shard_id}.apex'
+                shard_path = self.index_dir / 'shards' / f'shard_{shard_id}.nfts'
                 if not shard_path.exists() and not any(terms[term]['add'] for term in terms):
                     continue  # 没有需要添加的文档，且分片不存在，跳过
                 
@@ -685,7 +850,24 @@ class InvertedIndex(BaseIndex):
         """Merge the buffer"""
         if not self.index_buffer:
             return
+        
+        # 如果是内存模式（index_dir为None），直接合并到内存索引
+        if not self.index_dir:
+            for term, bitmap in self.index_buffer.items():
+                if term in self.word_index:
+                    self.word_index[term] |= bitmap
+                else:
+                    self.word_index[term] = bitmap.copy()
             
+            # Clear the buffer
+            self.index_buffer.clear()
+            # Clear the cache
+            self._bitmap_cache.cache_clear()
+            # 无效化词条缓存
+            self._invalidate_term_cache()
+            return
+            
+        # 磁盘模式：分片处理
         # Group by shard
         sharded_buffer = defaultdict(lambda: defaultdict(BitMap))
         for term, bitmap in self.index_buffer.items():
@@ -700,10 +882,12 @@ class InvertedIndex(BaseIndex):
         self.index_buffer.clear()
         # Clear the cache
         self._bitmap_cache.cache_clear()
+        # 无效化词条缓存
+        self._invalidate_term_cache()
 
     def _merge_shard(self, shard_id: int, terms: Dict[str, BitMap]) -> None:
         """Merge the data of a single shard"""
-        shard_path = self.index_dir / 'shards' / f'shard_{shard_id}.apex'
+        shard_path = self.index_dir / 'shards' / f'shard_{shard_id}.nfts'
         
         # Read the existing data
         existing_meta = {}
@@ -765,7 +949,7 @@ class InvertedIndex(BaseIndex):
         if self.word_index:
             word_dir = self.index_dir / 'word'
             word_dir.mkdir(exist_ok=True)
-            self._save_shard(self.word_index, word_dir / "index.apex", incremental)
+            self._save_shard(self.word_index, word_dir / "index.nfts", incremental)
         
         if incremental:
             self.modified_keys.clear()
@@ -841,13 +1025,13 @@ class InvertedIndex(BaseIndex):
             if not shards_dir.exists():
                 return False
                 
-            for shard_path in shards_dir.glob('*.apex'):
+            for shard_path in shards_dir.glob('*.nfts'):
                 self._load_shard(shard_path)
             
             # Load the word index
             word_dir = self.index_dir / 'word'
             if word_dir.exists():
-                word_index_path = word_dir / "index.apex"
+                word_index_path = word_dir / "index.nfts"
                 if word_index_path.exists():
                     self._load_shard(word_index_path, is_word_index=True)
             
@@ -900,7 +1084,7 @@ class InvertedIndex(BaseIndex):
         
         # Read the data from all shards
         if shards_dir.exists():
-            for shard_path in shards_dir.glob('*.apex'):
+            for shard_path in shards_dir.glob('*.nfts'):
                 try:
                     with open(shard_path, 'rb') as f:
                         meta_size = int.from_bytes(f.read(4), 'big')
@@ -942,7 +1126,7 @@ class InvertedIndex(BaseIndex):
         if self.index_dir:
             word_dir = self.index_dir / 'word'
             word_dir.mkdir(exist_ok=True)
-            self._save_shard(self.word_index, word_dir / "index.apex", False) 
+            self._save_shard(self.word_index, word_dir / "index.nfts", False) 
 
     def batch_remove_document(self, doc_ids: List[int]) -> None:
         """批量删除多个文档
@@ -980,7 +1164,7 @@ class InvertedIndex(BaseIndex):
             sharded_updates = defaultdict(set)
             
             # 收集所有需要更新的分片
-            for shard_path in shards_dir.glob('*.apex'):
+            for shard_path in shards_dir.glob('*.nfts'):
                 try:
                     with open(shard_path, 'rb') as f:
                         meta_size = int.from_bytes(f.read(4), 'big')

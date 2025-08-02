@@ -33,7 +33,7 @@ class BaseIndex(ABC):
         pass
 
     @abstractmethod
-    def search(self, query: str, score_threshold: Optional[float] = None) -> Union[BitMap, List[tuple[int, float]]]:
+    def search(self, query: str, enable_fuzzy: bool = False, min_results: int = 5, score_threshold: Optional[float] = None) -> Union[BitMap, List[tuple[int, float]]]:
         """Search for a query"""
         pass
 

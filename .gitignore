@@ -55,5 +55,5 @@ Cargo.lock
 *.cursorrules
 
 *.ipynb
-*.apex
+*.nfts
 *.msgpack
