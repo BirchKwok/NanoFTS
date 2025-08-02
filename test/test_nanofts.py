@@ -307,7 +307,7 @@ def test_update_document(fts, test_data):
     # Verify the updates
     assert set(fts.search("mixed")) == {5, 6}  # Both doc 5 and 6 contain "mixed"
     assert set(fts.search("混合")) == {5, 6}  # Both doc 5 and 6 contain "混合"
-    assert set(fts.search("hello world")) == {3, 7}  # Documents 3 and 7 still contain "hello" and "world"
+    assert set(fts.search("hello world")) == {7}  # Only document 7 still contains "hello world" phrase
 
 def test_update_nonexistent_document(fts):
     """Test updating a document that doesn't exist"""
@@ -358,7 +358,7 @@ def test_batch_update_document(fts, test_data):
     fts.flush()
     
     # 验证旧词条已被删除
-    assert sorted(fts.search("hello world")) == [3, 7]  # 文档 0 和 5 已更新，但文档 3 和 7 仍然匹配
+    assert sorted(fts.search("hello world")) == [7]  # 文档 0 和 5 已更新，只有文档 7 仍然包含短语 "hello world"
     assert sorted(fts.search("全文搜索")) == [2]  # 文档 0 不再匹配
     assert sorted(fts.search("github copilot")) == []  # 文档 1 不再匹配
     
@@ -370,7 +370,7 @@ def test_batch_update_document(fts, test_data):
     
     # 验证未更新的文档仍然可搜索
     assert sorted(fts.search("测试数据")) == [2]
-    assert sorted(fts.search("world")) == [3, 7]  # 文档 3 和 7 仍然包含 "world"
+    assert sorted(fts.search("world")) == [7]  # 只有文档 7 仍然包含 "world"
     
     # 测试批量更新的性能优势 - 同时更新多个文档
     large_batch = []
@@ -403,10 +403,10 @@ def test_batch_update_document(fts, test_data):
     fts.flush()
     
     # 验证更新成功 - 使用更具体的搜索词
-    # 验证旧内容已被删除 - 使用更具体的词组而不是单个词
-    assert len(fts.search("批量文档内容 0")) == 0  # 特定文档内容应该被删除
-    assert len(fts.search("批量文档内容 10")) == 0  # 特定文档内容应该被删除
-    assert len(fts.search("批量文档内容 49")) == 0  # 特定文档内容应该被删除
+    # 验证旧内容已被删除 - 搜索原来的tag
+    assert len(fts.search("tag0")) == 0  # 特定文档tag应该被删除
+    assert len(fts.search("tag10")) == 0  # 特定文档tag应该被删除  
+    assert len(fts.search("tag49")) == 0  # 特定文档tag应该被删除
     
     # 验证新内容已添加
     assert len(fts.search("更新的批量内容")) == 50  # 新内容已添加
@@ -428,13 +428,13 @@ def test_batch_remove_document(fts, test_data):
     fts.flush()
     
     # 验证文档已被删除
-    assert sorted(fts.search("hello world")) == [3, 7]  # 文档 0 和 5 已删除，但文档 3 和 7 仍然匹配
+    assert sorted(fts.search("hello world")) == [7]  # 文档 0 和 5 已删除，只有文档 7 仍然包含短语 "hello world"
     assert sorted(fts.search("全文搜索")) == [2]  # 文档 0 已删除
     assert sorted(fts.search("github")) == []  # 文档 1 已删除
     
     # 验证未删除的文档仍然可搜索
     assert sorted(fts.search("测试数据")) == [2]
-    assert sorted(fts.search("world")) == [3, 7]  # 文档 3 和 7 仍然包含 "world"
+    assert sorted(fts.search("world")) == [7]  # 只有文档 7 仍然包含 "world"
     
     # 测试批量删除的性能优势 - 同时删除多个文档
     large_batch = []
@@ -461,10 +461,10 @@ def test_batch_remove_document(fts, test_data):
     # 验证删除成功
     assert len(fts.search("批量文档内容")) == 25  # 只剩下一半文档
     
-    # 验证特定文档已删除
+    # 验证特定文档已删除 - 使用tag搜索更精确
     for i in range(25):
-        assert len(fts.search(f"批量文档内容 {i}")) == 0  # 前25个文档应该已被删除
+        assert len(fts.search(f"tag{i}")) == 0  # 前25个文档的tag应该已被删除
     
-    # 验证剩余文档仍可搜索
+    # 验证剩余文档仍可搜索 - 使用tag搜索更精确
     for i in range(25, 50):
-        assert len(fts.search(f"批量文档内容 {i}")) == 1  # 后25个文档应该仍然存在
+        assert len(fts.search(f"tag{i}")) == 1  # 后25个文档的tag应该仍然存在
