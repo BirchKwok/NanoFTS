@@ -8,6 +8,7 @@ from pyroaring import BitMap
 import xxhash
 
 from .base import BaseIndex
+from .file_manager import get_file_manager, safe_read_shard, safe_write_shard, safe_delete_shard
 
 
 class InvertedIndex(BaseIndex):
@@ -124,7 +125,8 @@ class InvertedIndex(BaseIndex):
             return None
             
         try:
-            with open(shard_path, 'rb') as f:
+            fm = get_file_manager()
+            with fm.safe_file_operation(shard_path, 'rb') as f:
                 meta_size = int.from_bytes(f.read(4), 'big')
                 meta_data = f.read(meta_size)
                 meta = msgpack.unpackb(meta_data, raw=False)
@@ -556,49 +558,40 @@ class InvertedIndex(BaseIndex):
         # Remove from the shards
         shards_dir = self.index_dir / 'shards'
         if shards_dir.exists():
+            fm = get_file_manager()
             for shard_path in shards_dir.glob('*.nfts'):
                 try:
-                    # Read the shard data
-                    with open(shard_path, 'rb') as f:
-                        meta_size = int.from_bytes(f.read(4), 'big')
-                        meta_data = f.read(meta_size)
-                        meta = msgpack.unpackb(meta_data, raw=False)
+                    # Read the shard data using safe file operations
+                    meta, shard_data = safe_read_shard(shard_path)
+                    
+                    modified = False
+                    new_data = {}
+                    new_meta = {}
+                    offset = 0
+                    
+                    # Process each term
+                    for term, bitmap_data in shard_data.items():
+                        bitmap = BitMap.deserialize(bitmap_data)
                         
-                        modified = False
-                        new_data = {}
-                        new_meta = {}
-                        offset = 0
-                        
-                        # Process each term
-                        for term, (term_offset, size) in meta.items():
-                            f.seek(4 + meta_size + term_offset)
-                            bitmap_data = f.read(size)
-                            bitmap = BitMap.deserialize(bitmap_data)
+                        if doc_id in bitmap:
+                            bitmap.discard(doc_id)
+                            modified = True
+                            self.modified_keys.add(term)
                             
-                            if doc_id in bitmap:
-                                bitmap.discard(doc_id)
-                                modified = True
-                                self.modified_keys.add(term)
-                                
-                            if bitmap:  # Only save non-empty bitmap
-                                bitmap_data = bitmap.serialize()
-                                new_data[term] = bitmap_data
-                                new_meta[term] = (offset, len(bitmap_data))
-                                offset += len(bitmap_data)
-                        
-                        # If there are modifications, rewrite the shard file
-                        if modified:
-                            if new_data:
-                                with open(shard_path, 'wb') as f:
-                                    meta_data = msgpack.packb(new_meta, use_bin_type=True)
-                                    f.write(len(meta_data).to_bytes(4, 'big'))
-                                    f.write(meta_data)
-                                    for bitmap_data in new_data.values():
-                                        f.write(bitmap_data)
-                            else:
-                                # If the shard is empty, delete the file
-                                shard_path.unlink()
-                                
+                        if bitmap:  # Only save non-empty bitmap
+                            bitmap_data = bitmap.serialize()
+                            new_data[term] = bitmap_data
+                            new_meta[term] = (offset, len(bitmap_data))
+                            offset += len(bitmap_data)
+                    
+                    # If there are modifications, rewrite the shard file
+                    if modified:
+                        if new_data:
+                            safe_write_shard(shard_path, new_meta, new_data)
+                        else:
+                            # If the shard is empty, delete the file
+                            safe_delete_shard(shard_path)
+                            
                 except Exception as e:
                     print(f"Error processing shard {shard_path}: {e}")
                     continue
@@ -714,31 +707,21 @@ class InvertedIndex(BaseIndex):
                 shard_path = self.index_dir / 'shards' / f'shard_{shard_id}.nfts'
                 if shard_path.exists():
                     try:
-                        with open(shard_path, 'rb') as f:
-                            meta_size = int.from_bytes(f.read(4), 'big')
-                            meta_data = f.read(meta_size)
-                            meta = msgpack.unpackb(meta_data, raw=False)
+                        meta, shard_data = safe_read_shard(shard_path)
+                        
+                        if term in shard_data:
+                            bitmap = BitMap.deserialize(shard_data[term])
+                            bitmap.discard(doc_id)
+                            self.modified_keys.add(term)
                             
-                            if term in meta:
-                                offset, size = meta[term]
-                                f.seek(4 + meta_size + offset)
-                                bitmap_data = f.read(size)
-                                bitmap = BitMap.deserialize(bitmap_data)
-                                bitmap.discard(doc_id)
-                                self.modified_keys.add(term)
-                                
-                                # 更新分片文件
-                                if bitmap:
-                                    new_data = {term: bitmap.serialize()}
-                                    new_meta = {term: (0, len(new_data[term]))}
-                                    with open(shard_path, 'wb') as f:
-                                        meta_data = msgpack.packb(new_meta, use_bin_type=True)
-                                        f.write(len(meta_data).to_bytes(4, 'big'))
-                                        f.write(meta_data)
-                                        f.write(new_data[term])
-                                else:
-                                    # 如果位图为空，删除文件
-                                    shard_path.unlink()
+                            # 更新分片文件
+                            if bitmap:
+                                new_data = {term: bitmap.serialize()}
+                                new_meta = {term: (0, len(new_data[term]))}
+                                safe_write_shard(shard_path, new_meta, new_data)
+                            else:
+                                # 如果位图为空，删除文件
+                                safe_delete_shard(shard_path)
                     except Exception as e:
                         print(f"Error updating shard {shard_path}: {e}")
                         continue
@@ -917,28 +900,22 @@ class InvertedIndex(BaseIndex):
                 
                 if shard_path.exists():
                     try:
-                        with open(shard_path, 'rb') as f:
-                            meta_size = int.from_bytes(f.read(4), 'big')
-                            meta_data = f.read(meta_size)
-                            existing_meta = msgpack.unpackb(meta_data, raw=False)
-                            
-                            for term, (offset, size) in existing_meta.items():
-                                if term in terms:  # 只读取需要更新的词条
-                                    f.seek(4 + meta_size + offset)
-                                    bitmap_data = f.read(size)
-                                    bitmap = BitMap.deserialize(bitmap_data)
-                                    
-                                    # 更新位图
-                                    for doc_id in terms[term]['remove']:
-                                        bitmap.discard(doc_id)
-                                    for doc_id in terms[term]['add']:
-                                        bitmap.add(doc_id)
-                                    
-                                    if bitmap:
-                                        existing_data[term] = bitmap.serialize()
-                                else:
-                                    f.seek(4 + meta_size + offset)
-                                    existing_data[term] = f.read(size)
+                        existing_meta, shard_data = safe_read_shard(shard_path)
+                        
+                        for term, bitmap_data in shard_data.items():
+                            if term in terms:  # 只更新需要更新的词条
+                                bitmap = BitMap.deserialize(bitmap_data)
+                                
+                                # 更新位图
+                                for doc_id in terms[term]['remove']:
+                                    bitmap.discard(doc_id)
+                                for doc_id in terms[term]['add']:
+                                    bitmap.add(doc_id)
+                                
+                                if bitmap:
+                                    existing_data[term] = bitmap.serialize()
+                            else:
+                                existing_data[term] = bitmap_data
                     except Exception as e:
                         print(f"Error reading shard {shard_path}: {e}")
                         continue
@@ -967,17 +944,11 @@ class InvertedIndex(BaseIndex):
                         new_meta[term] = (offset, len(data))
                         offset += len(data)
                     
-                    # 写入文件
-                    shard_path.parent.mkdir(exist_ok=True, parents=True)
-                    with open(shard_path, 'wb') as f:
-                        meta_data = msgpack.packb(new_meta, use_bin_type=True)
-                        f.write(len(meta_data).to_bytes(4, 'big'))
-                        f.write(meta_data)
-                        for data in existing_data.values():
-                            f.write(data)
+                    # 使用安全写入
+                    safe_write_shard(shard_path, new_meta, existing_data)
                 elif shard_path.exists():
-                    # 如果没有数据，删除文件
-                    shard_path.unlink()
+                    # 如果没有数据，安全删除文件
+                    safe_delete_shard(shard_path)
         
         # 5. 强制合并缓冲区以确保批量更新立即生效
         # 这对于Windows平台特别重要
@@ -1033,15 +1004,12 @@ class InvertedIndex(BaseIndex):
         existing_meta = {}
         existing_data = {}
         if shard_path.exists():
-            with open(shard_path, 'rb') as f:
-                meta_size = int.from_bytes(f.read(4), 'big')
-                meta_data = f.read(meta_size)
-                existing_meta = msgpack.unpackb(meta_data, raw=False)
-                
-                for term, (offset, size) in existing_meta.items():
-                    f.seek(4 + meta_size + offset)
-                    bitmap_data = f.read(size)
-                    existing_data[term] = bitmap_data
+            try:
+                existing_meta, shard_data = safe_read_shard(shard_path)
+                existing_data = shard_data
+            except Exception as e:
+                print(f"Error reading shard {shard_path} for merge: {e}")
+                existing_data = {}
         
         # Merge the data
         new_data = {}
@@ -1066,15 +1034,9 @@ class InvertedIndex(BaseIndex):
             new_meta[term] = (offset, len(bitmap_data))
             offset += len(bitmap_data)
         
-        # Save
+        # Save using safe operations
         if new_data:
-            shard_path.parent.mkdir(exist_ok=True)
-            with open(shard_path, 'wb') as f:
-                meta_data = msgpack.packb(new_meta, use_bin_type=True)
-                f.write(len(meta_data).to_bytes(4, 'big'))
-                f.write(meta_data)
-                for bitmap_data in new_data.values():
-                    f.write(bitmap_data)
+            safe_write_shard(shard_path, new_meta, new_data)
 
     def save(self, incremental: bool = True) -> None:
         """Save the index"""
@@ -1104,22 +1066,22 @@ class InvertedIndex(BaseIndex):
         """
         if not shard_data:
             if shard_path.exists():
-                shard_path.unlink()
+                safe_delete_shard(shard_path)
             return
             
         # Process the incremental update
         existing_meta = {}
         existing_data = {}
         if incremental and shard_path.exists():
-            with open(shard_path, 'rb') as f:
-                meta_size = int.from_bytes(f.read(4), 'big')
-                meta_data = f.read(meta_size)
-                existing_meta = msgpack.unpackb(meta_data, raw=False)
+            try:
+                existing_meta, existing_shard_data = safe_read_shard(shard_path)
                 
-                for key, (offset, size) in existing_meta.items():
+                for key, bitmap_data in existing_shard_data.items():
                     if key not in self.modified_keys:
-                        f.seek(4 + meta_size + offset)
-                        existing_data[key] = f.read(size)
+                        existing_data[key] = bitmap_data
+            except Exception as e:
+                print(f"Error reading existing shard {shard_path}: {e}")
+                # Continue with empty existing data
         
         # Prepare new data
         data = {}
@@ -1142,17 +1104,11 @@ class InvertedIndex(BaseIndex):
                 meta[key] = (offset, len(bitmap_data))
                 offset += len(bitmap_data)
         
-        # Save
+        # Save using safe operations
         if data:
-            shard_path.parent.mkdir(exist_ok=True)
-            with open(shard_path, 'wb') as f:
-                meta_data = msgpack.packb(meta, use_bin_type=True)
-                f.write(len(meta_data).to_bytes(4, 'big'))
-                f.write(meta_data)
-                for bitmap_data in data.values():
-                    f.write(bitmap_data)
+            safe_write_shard(shard_path, meta, data)
         elif shard_path.exists():
-            shard_path.unlink()
+            safe_delete_shard(shard_path)
 
     def load(self) -> bool:
         """Load the index"""
@@ -1191,25 +1147,20 @@ class InvertedIndex(BaseIndex):
             return
             
         try:
-            with open(shard_path, 'rb') as f:
-                meta_size = int.from_bytes(f.read(4), 'big')
-                meta_data = f.read(meta_size)
-                meta = msgpack.unpackb(meta_data, raw=False)
-                
-                for key, (offset, size) in meta.items():
-                    if len(key) >= self.min_term_length:
-                        f.seek(4 + meta_size + offset)
-                        bitmap_data = f.read(size)
-                        bitmap = BitMap.deserialize(bitmap_data)
-                        if is_word_index:
-                            self.word_index[key] |= bitmap
-                        else:
-                            # Add the data to the buffer
-                            self.index_buffer[key] |= bitmap
+            meta, shard_data = safe_read_shard(shard_path)
             
-                # If it is not the word index, merge to the disk
-                if not is_word_index and self.index_buffer:
-                    self.merge_buffer()
+            for key, bitmap_data in shard_data.items():
+                if len(key) >= self.min_term_length:
+                    bitmap = BitMap.deserialize(bitmap_data)
+                    if is_word_index:
+                        self.word_index[key] |= bitmap
+                    else:
+                        # Add the data to the buffer
+                        self.index_buffer[key] |= bitmap
+        
+            # If it is not the word index, merge to the disk
+            if not is_word_index and self.index_buffer:
+                self.merge_buffer()
                 
         except Exception as e:
             print(f"Failed to load the shard {shard_path}: {e}")
@@ -1226,23 +1177,18 @@ class InvertedIndex(BaseIndex):
         if shards_dir.exists():
             for shard_path in shards_dir.glob('*.nfts'):
                 try:
-                    with open(shard_path, 'rb') as f:
-                        meta_size = int.from_bytes(f.read(4), 'big')
-                        meta_data = f.read(meta_size)
-                        meta = msgpack.unpackb(meta_data, raw=False)
-                        
-                        for term, (offset, size) in meta.items():
-                            if ' ' in term:  # Only process the word with space
-                                f.seek(4 + meta_size + offset)
-                                bitmap_data = f.read(size)
-                                bitmap = BitMap.deserialize(bitmap_data)
-                                
-                                # Process the words in the phrase
-                                words = term.split()
-                                doc_ids = list(bitmap)
-                                for word in words:
-                                    if not self.chinese_pattern.search(word) and len(word) >= self.min_term_length:
-                                        temp_word_index[word].update(doc_ids)
+                    meta, shard_data = safe_read_shard(shard_path)
+                    
+                    for term, bitmap_data in shard_data.items():
+                        if ' ' in term:  # Only process the word with space
+                            bitmap = BitMap.deserialize(bitmap_data)
+                            
+                            # Process the words in the phrase
+                            words = term.split()
+                            doc_ids = list(bitmap)
+                            for word in words:
+                                if not self.chinese_pattern.search(word) and len(word) >= self.min_term_length:
+                                    temp_word_index[word].update(doc_ids)
                 except Exception as e:
                     print(f"Failed to process the shard {shard_path}: {e}")
                     continue
@@ -1306,51 +1252,41 @@ class InvertedIndex(BaseIndex):
             # 收集所有需要更新的分片
             for shard_path in shards_dir.glob('*.nfts'):
                 try:
-                    with open(shard_path, 'rb') as f:
-                        meta_size = int.from_bytes(f.read(4), 'big')
-                        meta_data = f.read(meta_size)
-                        meta = msgpack.unpackb(meta_data, raw=False)
+                    meta, shard_data = safe_read_shard(shard_path)
+                    
+                    modified = False
+                    new_data = {}
+                    new_meta = {}
+                    offset = 0
+                    
+                    # 处理每个词条
+                    for term, bitmap_data in shard_data.items():
+                        bitmap = BitMap.deserialize(bitmap_data)
                         
-                        modified = False
-                        new_data = {}
-                        new_meta = {}
-                        offset = 0
+                        term_modified = False
+                        for doc_id in doc_ids:
+                            if doc_id in bitmap:
+                                bitmap.discard(doc_id)
+                                term_modified = True
                         
-                        # 处理每个词条
-                        for term, (term_offset, size) in meta.items():
-                            f.seek(4 + meta_size + term_offset)
-                            bitmap_data = f.read(size)
-                            bitmap = BitMap.deserialize(bitmap_data)
+                        if term_modified:
+                            modified = True
+                            self.modified_keys.add(term)
                             
-                            term_modified = False
-                            for doc_id in doc_ids:
-                                if doc_id in bitmap:
-                                    bitmap.discard(doc_id)
-                                    term_modified = True
+                        if bitmap:  # 只保存非空位图
+                            bitmap_data = bitmap.serialize()
+                            new_data[term] = bitmap_data
+                            new_meta[term] = (offset, len(bitmap_data))
+                            offset += len(bitmap_data)
+                    
+                    # 如果有修改，重写分片文件
+                    if modified:
+                        if new_data:
+                            safe_write_shard(shard_path, new_meta, new_data)
+                        else:
+                            # 如果分片为空，安全删除文件
+                            safe_delete_shard(shard_path)
                             
-                            if term_modified:
-                                modified = True
-                                self.modified_keys.add(term)
-                                
-                            if bitmap:  # 只保存非空位图
-                                bitmap_data = bitmap.serialize()
-                                new_data[term] = bitmap_data
-                                new_meta[term] = (offset, len(bitmap_data))
-                                offset += len(bitmap_data)
-                        
-                        # 如果有修改，重写分片文件
-                        if modified:
-                            if new_data:
-                                with open(shard_path, 'wb') as f:
-                                    meta_data = msgpack.packb(new_meta, use_bin_type=True)
-                                    f.write(len(meta_data).to_bytes(4, 'big'))
-                                    f.write(meta_data)
-                                    for bitmap_data in new_data.values():
-                                        f.write(bitmap_data)
-                            else:
-                                # 如果分片为空，删除文件
-                                shard_path.unlink()
-                                
                 except Exception as e:
                     print(f"Error processing shard {shard_path}: {e}")
                     continue
