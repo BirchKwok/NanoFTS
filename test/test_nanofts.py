@@ -94,7 +94,7 @@ def test_incremental_update(fts, test_data):
     test_cases = [
         ("新增", [new_doc_id]),
         ("测试", [2, 6, new_doc_id]),
-        ("hello world", [0, 5])  # Only match the complete phrase
+        ("hello world", [0, 5])  # phrase search doesn't match "hello world test"
     ]
 
     for query, expected in test_cases:
@@ -102,6 +102,7 @@ def test_incremental_update(fts, test_data):
 
     # Test deleting documents
     fts.remove_document(new_doc_id)
+    fts.flush()  # Ensure deletion is persisted, especially on Windows
     
     for query, expected in test_cases:
         result = sorted(fts.search(query))
@@ -356,7 +357,7 @@ def test_batch_update_document(fts, test_data):
     # 更新文档 0, 1, 5
     fts.update_document([0, 1, 5], updated_docs)
     fts.flush()
-    
+
     # 验证旧词条已被删除
     assert sorted(fts.search("hello world")) == [7]  # 文档 0 和 5 已更新，只有文档 7 仍然包含短语 "hello world"
     assert sorted(fts.search("全文搜索")) == [2]  # 文档 0 不再匹配
@@ -401,7 +402,7 @@ def test_batch_update_document(fts, test_data):
     
     fts.update_document(large_ids, updated_batch)
     fts.flush()
-    
+
     # 验证更新成功 - 使用更具体的搜索词
     # 验证旧内容已被删除 - 搜索原来的tag
     assert len(fts.search("tag0")) == 0  # 特定文档tag应该被删除
@@ -426,7 +427,7 @@ def test_batch_remove_document(fts, test_data):
     # 批量删除文档 0, 1, 5
     fts.remove_document([0, 1, 5])
     fts.flush()
-    
+
     # 验证文档已被删除
     assert sorted(fts.search("hello world")) == [7]  # 文档 0 和 5 已删除，只有文档 7 仍然包含短语 "hello world"
     assert sorted(fts.search("全文搜索")) == [2]  # 文档 0 已删除
@@ -457,7 +458,7 @@ def test_batch_remove_document(fts, test_data):
     # 批量删除一半文档
     fts.remove_document(large_ids[:25])
     fts.flush()
-    
+
     # 验证删除成功
     assert len(fts.search("批量文档内容")) == 25  # 只剩下一半文档
     

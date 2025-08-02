@@ -617,6 +617,10 @@ class InvertedIndex(BaseIndex):
         
         # Clear the cache
         self._fast_cache.clear()
+        
+        # Ensure buffer changes are immediately available for search
+        # This is especially important on Windows platforms
+        self.merge_buffer()
 
     def update_terms(self, doc_id: int, terms: Dict[str, Union[str, int, float]]) -> None:
         """Update the terms of the document"""
@@ -752,9 +756,9 @@ class InvertedIndex(BaseIndex):
                         self.word_index[word].add(doc_id)
                         self.modified_keys.add(word)
         
-        # 合并缓冲区（如果需要）
-        if len(self.index_buffer) >= self.buffer_size:
-            self.merge_buffer()
+        # 强制合并缓冲区以确保更新立即生效
+        # 这对于Windows平台特别重要
+        self.merge_buffer()
         
         # 清理缓存
         self._fast_cache.clear()
@@ -975,9 +979,9 @@ class InvertedIndex(BaseIndex):
                     # 如果没有数据，删除文件
                     shard_path.unlink()
         
-        # 5. 合并缓冲区（如果需要）
-        if len(self.index_buffer) >= self.buffer_size:
-            self.merge_buffer()
+        # 5. 强制合并缓冲区以确保批量更新立即生效
+        # 这对于Windows平台特别重要
+        self.merge_buffer()
         
         # 6. 清理缓存
         self._fast_cache.clear()
@@ -1369,4 +1373,8 @@ class InvertedIndex(BaseIndex):
             del self.word_index[key]
         
         # 清理缓存
-        self._fast_cache.clear() 
+        self._fast_cache.clear()
+        
+        # 强制合并缓冲区以确保批量删除立即生效
+        # 这对于Windows平台特别重要
+        self.merge_buffer() 
