@@ -10,7 +10,8 @@ from .inserter import DocumentInserter
 
 
 class FullTextSearch:
-    def __init__(self, index_dir: str = None, 
+    def __init__(self, 
+                 index_dir: str = None, 
                  max_chinese_length: int = 4, 
                  num_workers: int = 8,
                  shard_size: int = 500_000,
@@ -19,7 +20,7 @@ class FullTextSearch:
                  batch_size: int = 10000,
                  drop_if_exists: bool = False,
                  buffer_size: int = 100000,
-                 fuzzy_threshold: float = 0.7,
+                 fuzzy_threshold: float = 0.4,
                  fuzzy_max_distance: int = 2):
         """
         Initialize the full-text search engine

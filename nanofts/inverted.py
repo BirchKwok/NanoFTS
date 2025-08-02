@@ -5,7 +5,6 @@ from collections import defaultdict
 from typing import Dict, Union, Optional, List, Tuple
 
 from pyroaring import BitMap
-from functools import lru_cache
 import xxhash
 
 from .base import BaseIndex
@@ -64,25 +63,52 @@ class InvertedIndex(BaseIndex):
         self._init_cache()
 
     def _init_cache(self) -> None:
-        """Initialize the LRU cache"""
-        @lru_cache(maxsize=self.cache_size)
-        def get_bitmap(term: str) -> Optional[BitMap]:
-            # 首先检查缓冲区
+        """Initialize the optimized cache"""
+        # 使用普通字典代替LRU缓存，减少查找开销
+        self._fast_cache = {}
+        self._cache_hits = 0
+        self._cache_max_size = self.cache_size
+        
+        def get_bitmap_fast(term: str) -> Optional[BitMap]:
+            # 快速缓存查找
+            if term in self._fast_cache:
+                self._cache_hits += 1
+                return self._fast_cache[term]
+            
+            # 首先检查缓冲区 - 避免不必要的拷贝
             if term in self.index_buffer:
-                return self.index_buffer[term].copy()
+                result = self.index_buffer[term]
+                # 缓存结果（不拷贝，直接引用）
+                self._cache_bitmap(term, result)
+                return result
             
             # 检查内存索引（内存模式）
             if term in self.word_index:
-                return self.word_index[term].copy()
+                result = self.word_index[term] 
+                self._cache_bitmap(term, result)
+                return result
             
             # 如果是磁盘模式，从磁盘加载
             if self.index_dir:
                 shard_id = self._get_shard_id(term)
-                return self._load_term_bitmap(term, shard_id)
+                result = self._load_term_bitmap(term, shard_id)
+                if result is not None:
+                    self._cache_bitmap(term, result)
+                return result
             
             return None
         
-        self._bitmap_cache = get_bitmap
+        self._bitmap_cache = get_bitmap_fast
+    
+    def _cache_bitmap(self, term: str, bitmap: BitMap) -> None:
+        """缓存bitmap，管理缓存大小"""
+        if len(self._fast_cache) >= self._cache_max_size:
+            # 清理一半缓存（简单策略）
+            keys_to_remove = list(self._fast_cache.keys())[:self._cache_max_size // 2]
+            for key in keys_to_remove:
+                del self._fast_cache[key]
+        
+        self._fast_cache[term] = bitmap
 
     def _get_shard_id(self, term: str) -> int:
         """Calculate the shard ID of the term"""
@@ -136,13 +162,27 @@ class InvertedIndex(BaseIndex):
                 for substr in self._global_chinese_cache[seg]:
                     self.index_buffer[substr].add(doc_id)
             
+            # Process English parts in mixed Chinese-English text
+            english_parts = re.findall(r'[a-zA-Z]+', field_str)
+            for eng_part in english_parts:
+                if len(eng_part) >= self.min_term_length:
+                    self.index_buffer[eng_part.lower()].add(doc_id)
+            
             # Process the phrase
             if ' ' in field_str:
                 self.index_buffer[field_str].add(doc_id)
                 words = field_str.split()
                 for word in words:
+                    # 处理纯英文单词
                     if len(word) >= self.min_term_length and not self.chinese_pattern.search(word):
                         self.index_buffer[word].add(doc_id)
+                    # 处理中英文混合单词，提取英文部分
+                    elif self.chinese_pattern.search(word):
+                        # 提取英文字母序列
+                        english_parts = re.findall(r'[a-zA-Z]+', word)
+                        for eng_part in english_parts:
+                            if len(eng_part) >= self.min_term_length:
+                                self.index_buffer[eng_part.lower()].add(doc_id)
 
         # Merge the buffer when it reaches the threshold
         if len(self.index_buffer) >= self.buffer_size:
@@ -174,15 +214,44 @@ class InvertedIndex(BaseIndex):
 
     @staticmethod
     def _similarity_score(s1: str, s2: str) -> float:
-        """计算两个字符串的相似度分数 (0.0-1.0)"""
+        """计算两个字符串的相似度分数 (0.0-1.0)，针对中文优化"""
         if not s1 and not s2:
             return 1.0
         if not s1 or not s2:
             return 0.0
         
+        # 基于编辑距离的相似度
         distance = InvertedIndex._levenshtein_distance(s1, s2)
         max_len = max(len(s1), len(s2))
-        return 1.0 - (distance / max_len)
+        edit_similarity = 1.0 - (distance / max_len)
+        
+        # 基于字符重叠的相似度 (特别适合中文)
+        set1, set2 = set(s1), set(s2)
+        intersection = len(set1 & set2)
+        union = len(set1 | set2)
+        char_overlap = intersection / union if union > 0 else 0.0
+        
+        # 基于最长公共子序列的相似度
+        def lcs_length(s1, s2):
+            m, n = len(s1), len(s2)
+            dp = [[0] * (n + 1) for _ in range(m + 1)]
+            
+            for i in range(1, m + 1):
+                for j in range(1, n + 1):
+                    if s1[i-1] == s2[j-1]:
+                        dp[i][j] = dp[i-1][j-1] + 1
+                    else:
+                        dp[i][j] = max(dp[i-1][j], dp[i][j-1])
+            return dp[m][n]
+        
+        lcs_len = lcs_length(s1, s2)
+        lcs_similarity = lcs_len / max_len if max_len > 0 else 0.0
+        
+        # 混合相似度：取三种算法的最大值，更宽松地匹配中文
+        # 这样"支持"和"一支"就能有合理的相似度了
+        final_similarity = max(edit_similarity, char_overlap, lcs_similarity)
+        
+        return final_similarity
 
     def _get_all_terms(self) -> set:
         """获取所有索引中的词条，用于模糊搜索"""
@@ -259,18 +328,33 @@ class InvertedIndex(BaseIndex):
         return result
 
     def search(self, query: str, enable_fuzzy: bool = False, min_results: int = 5) -> BitMap:
-        """Search for a query"""
-        # Quick path - return directly
-        query = query.strip().lower()
+        """Search for a query - optimized version"""
+        # 预处理优化：减少字符串操作
         if not query:
             return BitMap()
         
-        # Modify the exact match part
+        # 只在必要时进行字符串转换
+        if query != query.strip().lower():
+            query = query.strip().lower()
+            if not query:
+                return BitMap()
+        
+        # 快速路径：单个英文单词（最常见的查询）
+        if ' ' not in query and not self.chinese_pattern.search(query):
+            result = self._bitmap_cache(query)
+            if result is not None:
+                # 对于读取操作，直接返回引用而不是拷贝
+                return result
+            else:
+                return BitMap()  # 快速返回空结果
+        
+        # 直接匹配优化：避免不必要的拷贝
         result = self._bitmap_cache(query)
         if result is not None:
-            return result.copy()  # Return a copy to avoid modifying the cache
+            # 对于读取操作，直接返回引用而不是拷贝
+            return result
         
-        # 2. Phrase query optimization - faster than Chinese query, so process it first
+        # 2. Phrase query optimization - 支持中英文混合搜索
         if ' ' in query:
             words = query.split()
             if not words:
@@ -281,19 +365,24 @@ class InvertedIndex(BaseIndex):
             min_size = float('inf')
             min_idx = 0
             
+            # 优化：预分配结果列表，提前检查词长度
+            valid_words = [word for word in words if len(word) >= self.min_term_length]
+            if not valid_words:
+                return BitMap()
+            
             # Get all the document sets of all the words at once
-            for i, word in enumerate(words):
-                if len(word) < self.min_term_length:
-                    continue
-                    
+            for i, word in enumerate(valid_words):
+                # 首先尝试直接匹配完整单词
                 docs = self._bitmap_cache(word)
-                if docs is None:
+                
+                # 如果直接匹配失败且单词包含中文，则尝试中文子串匹配
+                if docs is None and self.chinese_pattern.search(word):
+                    docs = self._search_chinese_word(word)
+                
+                if docs is None or len(docs) == 0:
                     return BitMap()  # Quick failure
                 
                 size = len(docs)
-                if size == 0:
-                    return BitMap()
-                
                 if size < min_size:
                     min_size = size
                     min_idx = len(results)
@@ -383,6 +472,53 @@ class InvertedIndex(BaseIndex):
                 return exact_result | fuzzy_result
         
         return exact_result if exact_result is not None else BitMap()
+
+    def _search_chinese_word(self, word: str) -> Optional[BitMap]:
+        """对包含中文的单词进行子串搜索"""
+        n = len(word)
+        if n < self.min_term_length:
+            return None
+        
+        # 尝试不同长度的子串，从最长开始
+        max_len = min(n, self.max_chinese_length)
+        
+        # 首先尝试最长匹配
+        for i in range(n - max_len + 1):
+            substr = word[i:i + max_len]
+            result = self._bitmap_cache(substr)
+            if result is not None:
+                if len(result) < 1000:  # 如果结果较少，直接返回
+                    return result
+                # 保存第一个匹配结果
+                first_match = result
+                
+                # 尝试与相邻子串交集以获得更精确的结果
+                if i > 0:
+                    prev_substr = word[i-1:i-1+max_len]
+                    prev_docs = self._bitmap_cache(prev_substr)
+                    if prev_docs is not None:
+                        temp = result & prev_docs
+                        if temp:
+                            return temp
+                
+                if i < n - max_len:
+                    next_substr = word[i+1:i+1+max_len]
+                    next_docs = self._bitmap_cache(next_substr)
+                    if next_docs is not None:
+                        temp = result & next_docs
+                        if temp:
+                            return temp
+                
+                return first_match
+        
+        # 如果最长匹配失败，尝试最小长度匹配
+        for i in range(n - self.min_term_length + 1):
+            substr = word[i:i + self.min_term_length]
+            result = self._bitmap_cache(substr)
+            if result is not None:
+                return result
+        
+        return None
 
     def _perform_fuzzy_search(self, query: str) -> BitMap:
         """执行模糊搜索并返回合并的结果"""
@@ -480,7 +616,7 @@ class InvertedIndex(BaseIndex):
             del self.word_index[key]
         
         # Clear the cache
-        self._bitmap_cache.cache_clear()
+        self._fast_cache.clear()
 
     def update_terms(self, doc_id: int, terms: Dict[str, Union[str, int, float]]) -> None:
         """Update the terms of the document"""
@@ -621,7 +757,7 @@ class InvertedIndex(BaseIndex):
             self.merge_buffer()
         
         # 清理缓存
-        self._bitmap_cache.cache_clear()
+        self._fast_cache.clear()
 
     def batch_update_terms(self, doc_ids: List[int], docs_terms: List[Dict[str, Union[str, int, float]]]) -> None:
         """批量更新多个文档的词条
@@ -844,7 +980,7 @@ class InvertedIndex(BaseIndex):
             self.merge_buffer()
         
         # 6. 清理缓存
-        self._bitmap_cache.cache_clear()
+        self._fast_cache.clear()
 
     def merge_buffer(self) -> None:
         """Merge the buffer"""
@@ -862,7 +998,7 @@ class InvertedIndex(BaseIndex):
             # Clear the buffer
             self.index_buffer.clear()
             # Clear the cache
-            self._bitmap_cache.cache_clear()
+            self._fast_cache.clear()
             # 无效化词条缓存
             self._invalidate_term_cache()
             return
@@ -881,7 +1017,7 @@ class InvertedIndex(BaseIndex):
         # Clear the buffer
         self.index_buffer.clear()
         # Clear the cache
-        self._bitmap_cache.cache_clear()
+        self._fast_cache.clear()
         # 无效化词条缓存
         self._invalidate_term_cache()
 
@@ -1233,4 +1369,4 @@ class InvertedIndex(BaseIndex):
             del self.word_index[key]
         
         # 清理缓存
-        self._bitmap_cache.cache_clear() 
+        self._fast_cache.clear() 
