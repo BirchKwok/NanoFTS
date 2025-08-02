@@ -5,7 +5,7 @@ A lightweight full-text search engine implementation in Python, featuring effici
 ## Features
 
 - Lightweight and efficient full-text search implementation
-- Pure Python with minimal dependencies (only requires `pyroaring` and `msgpack`)
+- Pure Python with minimal dependencies (only requires `pyroaring` and `msgpack` and `xxhash`)
 - Support for both English and Chinese text
 - Memory-efficient disk-based index storage with sharding
 - Incremental indexing and real-time updates
