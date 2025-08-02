@@ -28,7 +28,7 @@ jobs:
         shell: bash
         run: |
           python -m pip install --upgrade pip
-          python -m pip install build pytest pandas polars pyarrow
+          python -m pip install build pytest pandas polars pyarrow pyroaring msgpack
           
       # Install system dependencies (Linux)
       - name: Install system dependencies (Linux)
