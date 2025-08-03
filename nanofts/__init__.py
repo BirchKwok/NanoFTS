@@ -260,3 +260,6 @@ class FullTextSearch:
             self.fuzzy_max_distance = fuzzy_max_distance
             self.inverted_index.fuzzy_max_distance = fuzzy_max_distance
 
+
+
+__version__ = "0.2.0"
