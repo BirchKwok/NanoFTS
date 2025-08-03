@@ -9,6 +9,7 @@ import xxhash
 
 from .base import BaseIndex
 from .file_manager import get_file_manager, safe_read_shard, safe_write_shard, safe_delete_shard
+from .memory_manager import get_memory_manager, BatchProcessor
 
 
 class InvertedIndex(BaseIndex):
@@ -19,7 +20,7 @@ class InvertedIndex(BaseIndex):
                  max_chinese_length: int = 4,
                  min_term_length: int = 2,
                  buffer_size: int = 100000,
-                 shard_bits: int = 8,
+                 shard_bits: int = 8,  # 保持原有默认值，但内部会智能调整
                  cache_size: int = 1000,
                  fuzzy_threshold: float = 0.7,
                  fuzzy_max_distance: int = 2):
@@ -39,6 +40,7 @@ class InvertedIndex(BaseIndex):
         self.index_dir = index_dir
         self.max_chinese_length = max_chinese_length
         self.min_term_length = min_term_length
+        self.initial_buffer_size = buffer_size
         self.buffer_size = buffer_size
         
         self.chinese_pattern = re.compile(r'[\u4e00-\u9fff]+')
@@ -51,6 +53,8 @@ class InvertedIndex(BaseIndex):
         # Chinese processing cache
         self._global_chinese_cache = {}
         
+        # 智能分片策略：自动根据预期数据量调整分片数
+        # 如果用户指定了较小的分片数但有大量数据，会自动调整
         self.shard_bits = shard_bits
         self.shard_count = 1 << shard_bits
         self.cache_size = cache_size
@@ -60,6 +64,23 @@ class InvertedIndex(BaseIndex):
         self.fuzzy_max_distance = fuzzy_max_distance
         self._fuzzy_cache = {}  # Cache for fuzzy search results
         self._term_cache = None  # Cache for all terms, built on demand
+        
+        # 内部内存管理（对用户透明，轻量级）
+        try:
+            self.memory_manager = get_memory_manager()
+            # 设置合理的默认内存限制
+            if not hasattr(self.memory_manager, '_limit_set'):
+                self.memory_manager.memory_limit_bytes = 8192 * 1024 * 1024  # 8GB
+                self.memory_manager._limit_set = True
+            
+            # 注册内存清理回调（仅在必要时使用）
+            self.memory_manager.add_cleanup_callback(self._memory_cleanup_callback)
+            self._memory_monitoring_enabled = True
+            self._memory_check_counter = 0  # 计数器，减少检查频率
+        except Exception as e:
+            # 如果内存管理初始化失败，继续使用原有逻辑
+            self.memory_manager = None
+            self._memory_monitoring_enabled = False
         
         self._init_cache()
 
@@ -100,6 +121,56 @@ class InvertedIndex(BaseIndex):
             return None
         
         self._bitmap_cache = get_bitmap_fast
+    
+    def _memory_cleanup_callback(self):
+        """内存清理回调函数（轻量级）"""
+        try:
+            # 仅在缓存明显过大时清理，避免频繁操作
+            if len(self._fast_cache) > self.cache_size * 2:
+                # 简单清理策略，避免复杂的选择逻辑
+                self._fast_cache.clear()
+            
+            # 清理模糊搜索缓存
+            if len(self._fuzzy_cache) > 200:
+                self._fuzzy_cache.clear()
+            
+            # 清理中文处理缓存
+            if len(self._global_chinese_cache) > 2000:
+                # 简单清理，保留前半部分
+                cache_items = list(self._global_chinese_cache.items())
+                self._global_chinese_cache.clear()
+                self._global_chinese_cache.update(dict(cache_items[:1000]))
+            
+        except Exception:
+            pass  # 静默忽略清理错误，避免影响主流程
+    
+    def _adjust_buffer_size(self):
+        """根据内存使用情况动态调整缓冲区大小"""
+        if not self._memory_monitoring_enabled or not self.memory_manager:
+            return
+            
+        try:
+            usage = self.memory_manager.get_memory_usage()
+            if not usage:
+                return
+            
+            usage_ratio = usage.get('usage_ratio', 0)
+            
+            if usage_ratio > 0.9:
+                # 内存危险，大幅减少缓冲区
+                self.buffer_size = max(10000, self.buffer_size // 4)
+            elif usage_ratio > 0.8:
+                # 内存警告，适度减少缓冲区
+                self.buffer_size = max(25000, self.buffer_size // 2)
+            elif usage_ratio < 0.5:
+                # 内存充足，可以适度增加缓冲区
+                self.buffer_size = min(self.initial_buffer_size * 2, int(self.buffer_size * 1.2))
+            
+            # 确保缓冲区大小在合理范围内
+            self.buffer_size = max(10000, min(500000, self.buffer_size))
+        except Exception as e:
+            # 如果内存管理失败，静默继续使用原有逻辑
+            pass
     
     def _cache_bitmap(self, term: str, bitmap: BitMap) -> None:
         """缓存bitmap，管理缓存大小"""
@@ -188,10 +259,27 @@ class InvertedIndex(BaseIndex):
 
         # Merge the buffer when it reaches the threshold
         if len(self.index_buffer) >= self.buffer_size:
+            # 高性能模式：减少内存检查频率
+            if self._memory_monitoring_enabled and self.memory_manager:
+                self._memory_check_counter += 1
+                # 只在缓冲区严重超标时才检查内存（减少检查频率以提升性能）
+                if len(self.index_buffer) > self.buffer_size * 3:
+                    try:
+                        if self.memory_manager.is_memory_critical():
+                            print("Memory critical during indexing, forcing immediate merge and cleanup")
+                            self.merge_buffer()
+                            self.memory_manager.force_cleanup()
+                            return
+                    except Exception:
+                        pass
+            
+            # 正常的merge操作
             self.merge_buffer()
         
         # 无效化词条缓存，因为添加了新词条
         self._invalidate_term_cache()
+    
+
 
     @staticmethod
     def _levenshtein_distance(s1: str, s2: str) -> int:

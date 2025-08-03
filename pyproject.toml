@@ -29,8 +29,9 @@ keywords = ["full-text-search", "indexing", "search-engine", "chinese-text", "fu
 requires-python = ">=3.9"
 dependencies = [
     "msgpack",
-    "pyroaring",
-    "xxhash"
+    "pyroaring", 
+    "xxhash",
+    "psutil"
 ]
 
 [project.optional-dependencies]
