@@ -7,8 +7,34 @@ on:
   workflow_dispatch:
 
 jobs:
-  build_wheels:
-    name: Build wheels on ${{ matrix.os }} - Python ${{ matrix.python }}
+  build_sdist:
+    name: Build source distribution
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build
+          
+      - name: Build source distribution
+        run: python -m build --sdist
+          
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  test:
+    name: Test on ${{ matrix.os }} - Python ${{ matrix.python }}
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -28,7 +54,7 @@ jobs:
         shell: bash
         run: |
           python -m pip install --upgrade pip
-          python -m pip install build pytest pandas polars pyarrow pyroaring msgpack xxhash psutil
+          python -m pip install pytest pandas polars pyarrow pyroaring msgpack xxhash psutil
           
       # Install system dependencies (Linux)
       - name: Install system dependencies (Linux)
@@ -39,26 +65,48 @@ jobs:
           sudo apt-get clean
           sudo rm -rf /var/lib/apt/lists/*
         
+      # Install package in development mode
+      - name: Install package
+        run: python -m pip install -e .
+        
       # Run tests
       - name: Run tests
         shell: bash
         run: |
           python -m pytest test/
+
+  build_wheel:
+    name: Build universal wheel
+    runs-on: ubuntu-latest
+    needs: [test]
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build
         
-      # Build package
-      - name: Build package
-        run: python -m build
+      # Build universal wheel
+      - name: Build wheel
+        run: python -m build --wheel
           
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.os }}-${{ matrix.python }}
-          path: dist
+          name: wheel
+          path: dist/*.whl
 
   release:
     name: Release
     runs-on: ubuntu-latest
-    needs: [build_wheels]
+    needs: [build_sdist, build_wheel]
     if: startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: write
@@ -66,12 +114,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: Download artifacts
+      - name: Download wheel artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: wheels-*
-          path: dist
-          merge-multiple: true
+          name: wheel
+          path: artifacts/wheel
+          
+      - name: Download sdist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: artifacts/sdist
+          
+      - name: Organize artifacts
+        run: |
+          mkdir -p dist
+          # Copy wheel
+          cp artifacts/wheel/*.whl dist/
+          # Copy sdist
+          cp artifacts/sdist/*.tar.gz dist/
+          # Show what we have
+          echo "Files in dist directory:"
+          ls -la dist/
           
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
@@ -88,6 +152,17 @@ jobs:
           
       - name: Install twine
         run: python -m pip install --upgrade twine
+        
+      - name: Verify package integrity
+        run: |
+          echo "Verifying package integrity..."
+          for file in dist/*.whl; do
+            if [ -f "$file" ]; then
+              echo "Checking $file"
+              python -m zipfile -l "$file" > /dev/null || (echo "Error: $file is corrupted" && exit 1)
+            fi
+          done
+          python -m twine check dist/*
         
       - name: Upload to PyPI
         env:
