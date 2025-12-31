@@ -50,10 +50,22 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install pytest maturin
 
-      - name: Build and install package
+      - name: Build and install package (Unix)
+        if: runner.os != 'Windows'
         run: |
-          chmod +x build.sh
-          ./build.sh --develop --release
+          cp README.md nanofts/README.md
+          cd nanofts
+          maturin build --release --out dist
+          pip install dist/*.whl
+
+      - name: Build and install package (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          copy README.md nanofts\README.md
+          cd nanofts
+          maturin build --release --out dist
+          pip install (Get-ChildItem dist\*.whl).FullName
+        shell: pwsh
 
       - name: Run tests
         run: python -m pytest test/ -v
