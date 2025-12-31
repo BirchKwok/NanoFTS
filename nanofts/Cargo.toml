@@ -1,0 +1,94 @@
+[package]
+name = "nanofts"
+version = "0.3.0"
+edition = "2021"
+authors = ["Birch Kwok"]
+description = "High-performance full-text search engine in Rust"
+license = "Apache-2.0"
+rust-version = "1.75"
+
+[lib]
+name = "nanofts"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Python绑定
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"] }
+
+# 高性能Roaring Bitmap
+roaring = "0.10"
+
+# 内存映射
+memmap2 = "0.9"
+
+# 并行计算
+rayon = "1.10"
+
+# 高性能哈希
+xxhash-rust = { version = "0.8", features = ["xxh32", "xxh64"] }
+ahash = "0.8"
+rustc-hash = "2.0"
+
+# 无锁并发
+dashmap = "6.1"
+parking_lot = "0.12"
+crossbeam = "0.8"
+
+# LRU 缓存
+lru = "0.12"
+
+# 序列化
+bincode = "1.3"
+serde = { version = "1.0", features = ["derive"] }
+
+# 压缩
+lz4_flex = "0.11"
+zstd = "0.13"
+flate2 = "1.0"
+
+# CRC校验
+crc32fast = "1.4"
+
+# SIMD加速
+packed_simd_2 = { version = "0.3", optional = true }
+
+# 字符串处理
+unicode-segmentation = "1.11"
+regex = "1.11"
+
+# 内存分配器
+mimalloc = { version = "0.1", default-features = false }
+
+# 错误处理
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Numpy支持
+numpy = "0.22"
+
+# 日志
+log = "0.4"
+env_logger = "0.11"
+
+# 时间
+instant = "0.1"
+
+[features]
+default = ["mimalloc"]
+simd = ["packed_simd_2"]
+mimalloc = ["mimalloc/local_dynamic_tls"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.release.build-override]
+opt-level = 3
+
+[profile.bench]
+opt-level = 3
+lto = "fat"
+

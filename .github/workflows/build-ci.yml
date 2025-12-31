@@ -4,139 +4,210 @@ on:
   push:
     tags:
       - 'v*'
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  build_sdist:
-    name: Build source distribution
-    runs-on: ubuntu-latest
-    
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-          
-      - name: Install build dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install build
-          
-      - name: Build source distribution
-        run: python -m build --sdist
-          
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: sdist
-          path: dist/*.tar.gz
-
+  # ============================================
+  # 测试阶段：覆盖所有平台和 Python 版本
+  # ============================================
   test:
-    name: Test on ${{ matrix.os }} - Python ${{ matrix.python }}
+    name: Test - ${{ matrix.os }} - Python ${{ matrix.python }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        python: ['3.9', '3.10', '3.11', '3.12']
+        python: ['3.9', '3.10', '3.11', '3.12', '3.13']
+        include:
+          # Python 3.14 开发版测试（可选，允许失败）
+          - os: ubuntu-latest
+            python: '3.14-dev'
+          - os: macos-latest
+            python: '3.14-dev'
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python ${{ matrix.python }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-          
-      # Install Python dependencies
-      - name: Install Python dependencies
-        shell: bash
+          allow-prereleases: true
+
+      - name: Set up Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "nanofts -> target"
+
+      - name: Install Python test dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pytest pandas polars pyarrow pyroaring msgpack xxhash psutil
-          
-      # Install system dependencies (Linux)
-      - name: Install system dependencies (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential
-          sudo apt-get clean
-          sudo rm -rf /var/lib/apt/lists/*
-        
-      # Install package in development mode
-      - name: Install package
-        run: python -m pip install -e .
-        
-      # Run tests
-      - name: Run tests
-        shell: bash
-        run: |
-          python -m pytest test/
+          python -m pip install pytest maturin
 
-  build_wheel:
-    name: Build universal wheel
+      - name: Build and install package
+        working-directory: nanofts
+        run: |
+          maturin develop --release
+
+      - name: Run tests
+        run: python -m pytest test/ -v
+        
+    continue-on-error: ${{ contains(matrix.python, 'dev') }}
+
+  # ============================================
+  # 构建源代码分发包
+  # ============================================
+  build_sdist:
+    name: Build source distribution
     runs-on: ubuntu-latest
     needs: [test]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+          working-directory: nanofts
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: nanofts/dist/*.tar.gz
+
+  # ============================================
+  # 构建 Linux wheels (manylinux)
+  # ============================================
+  build_linux:
+    name: Build Linux wheels
+    runs-on: ubuntu-latest
+    needs: [test]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    strategy:
+      matrix:
+        target: [x86_64, aarch64]
     
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
         with:
-          python-version: '3.12'
-          
-      - name: Install build dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install build
-        
-      # Build universal wheel
-      - name: Build wheel
-        run: python -m build --wheel
-          
-      - name: Upload artifacts
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          manylinux: auto
+          working-directory: nanofts
+
+      - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
-          name: wheel
-          path: dist/*.whl
+          name: wheels-linux-${{ matrix.target }}
+          path: nanofts/dist/*.whl
 
+  # ============================================
+  # 构建 macOS wheels (x86_64 + arm64)
+  # ============================================
+  build_macos:
+    name: Build macOS wheels
+    runs-on: ${{ matrix.runner }}
+    needs: [test]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    strategy:
+      matrix:
+        include:
+          - runner: macos-13
+            target: x86_64-apple-darwin
+          - runner: macos-14
+            target: aarch64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          working-directory: nanofts
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-${{ matrix.target }}
+          path: nanofts/dist/*.whl
+
+  # ============================================
+  # 构建 Windows wheels
+  # ============================================
+  build_windows:
+    name: Build Windows wheels
+    runs-on: windows-latest
+    needs: [test]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    strategy:
+      matrix:
+        target: [x64]
+        # 如需支持 ARM64 Windows，可添加：arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          working-directory: nanofts
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-${{ matrix.target }}
+          path: nanofts/dist/*.whl
+
+  # ============================================
+  # 发布到 GitHub Release 和 PyPI
+  # ============================================
   release:
     name: Release
     runs-on: ubuntu-latest
-    needs: [build_sdist, build_wheel]
-    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build_sdist, build_linux, build_macos, build_windows]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: write
-    
+
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Download wheel artifacts
+
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          name: wheel
-          path: artifacts/wheel
-          
-      - name: Download sdist artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: sdist
-          path: artifacts/sdist
-          
+          path: artifacts
+
       - name: Organize artifacts
         run: |
           mkdir -p dist
-          # Copy wheel
-          cp artifacts/wheel/*.whl dist/
-          # Copy sdist
-          cp artifacts/sdist/*.tar.gz dist/
-          # Show what we have
-          echo "Files in dist directory:"
+          # 收集所有 wheel 和 sdist
+          find artifacts -name "*.whl" -exec cp {} dist/ \;
+          find artifacts -name "*.tar.gz" -exec cp {} dist/ \;
+          echo "=== 构建产物列表 ==="
           ls -la dist/
-          
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
@@ -149,24 +220,23 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-          
+
       - name: Install twine
         run: python -m pip install --upgrade twine
-        
+
       - name: Verify package integrity
         run: |
-          echo "Verifying package integrity..."
+          echo "验证包完整性..."
           for file in dist/*.whl; do
             if [ -f "$file" ]; then
-              echo "Checking $file"
-              python -m zipfile -l "$file" > /dev/null || (echo "Error: $file is corrupted" && exit 1)
+              echo "检查 $file"
+              python -m zipfile -l "$file" > /dev/null || (echo "错误: $file 已损坏" && exit 1)
             fi
           done
           python -m twine check dist/*
-        
+
       - name: Upload to PyPI
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
-        run: python -m twine upload dist/*
-        
+        run: python -m twine upload dist/* --skip-existing
