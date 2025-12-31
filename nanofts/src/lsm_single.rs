@@ -69,12 +69,12 @@ struct FileHeader {
 }
 
 /// Term index entry (for lazy load mode)
+/// Stores multiple locations since a term may appear in multiple blocks
 #[derive(Clone, Debug)]
 struct TermIndexEntry {
-    /// File offset (pointing to compressed data)
-    offset: u64,
-    /// Compressed data length
-    len: u32,
+    /// List of (file_offset, data_len) pairs
+    /// Each pair points to compressed data in a different block
+    locations: Vec<(u64, u32)>,
 }
 
 /// In-memory data block
@@ -420,11 +420,10 @@ impl LsmSingleIndex {
             // Skip compressed data
             offset += data_len as usize;
             
-            // Save index entry (keep latest if duplicate term)
-            result.insert(term, TermIndexEntry {
-                offset: file_offset,
-                len: data_len,
-            });
+            // Save index entry (append if duplicate term - a term may appear in multiple blocks)
+            result.entry(term)
+                .or_insert_with(|| TermIndexEntry { locations: Vec::new() })
+                .locations.push((file_offset, data_len));
         }
         
         Ok(())
@@ -495,32 +494,44 @@ impl LsmSingleIndex {
     /// Load single term's bitmap from file on demand
     fn load_term_from_file(&self, entry: &TermIndexEntry) -> Option<FastBitmap> {
         let mut file = self.file.write();
+        let mut result: Option<FastBitmap> = None;
         
-        // Seek to compressed data position
-        if file.seek(SeekFrom::Start(entry.offset)).is_err() {
-            return None;
+        // Load and merge all locations for this term
+        for &(offset, len) in &entry.locations {
+            // Seek to compressed data position
+            if file.seek(SeekFrom::Start(offset)).is_err() {
+                continue;
+            }
+            
+            // Read compressed data
+            let mut compressed = vec![0u8; len as usize];
+            if file.read_exact(&mut compressed).is_err() {
+                continue;
+            }
+            
+            // Decompress
+            let decompressed = match zstd::decode_all(&compressed[..]) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            
+            // Decode bitmap
+            let bitmap = if let Ok(b) = FastBitmap::deserialize(&decompressed) {
+                b
+            } else if let Some((ids, _)) = vbyte::decode_sorted_u32_array(&decompressed) {
+                FastBitmap::from_iter(ids)
+            } else {
+                continue;
+            };
+            
+            // Merge into result
+            result = match result {
+                Some(existing) => Some(existing.or(&bitmap)),
+                None => Some(bitmap),
+            };
         }
         
-        // Read compressed data
-        let mut compressed = vec![0u8; entry.len as usize];
-        if file.read_exact(&mut compressed).is_err() {
-            return None;
-        }
-        
-        // Decompress
-        let decompressed = match zstd::decode_all(&compressed[..]) {
-            Ok(d) => d,
-            Err(_) => return None,
-        };
-        
-        // Decode bitmap
-        if let Ok(bitmap) = FastBitmap::deserialize(&decompressed) {
-            Some(bitmap)
-        } else if let Some((ids, _)) = vbyte::decode_sorted_u32_array(&decompressed) {
-            Some(FastBitmap::from_iter(ids))
-        } else {
-            None
-        }
+        result
     }
     
     /// Insert single term-doc pair
@@ -790,7 +801,7 @@ impl LsmSingleIndex {
         
         // Update in-memory data based on mode
         if self.lazy_load {
-            // Lazy load mode: update index directory and put into cache
+            // Lazy load mode: update index directory and clear cache
             // Rescan file to get new offsets
             let mut file = self.file.write();
             let header = self.header.read();
@@ -798,24 +809,15 @@ impl LsmSingleIndex {
                 drop(header);
                 drop(file);
                 
-                // Merge new index
-                let mut term_index = self.term_index.write();
-                for (term, entry) in new_index {
-                    term_index.insert(term, entry);
-                }
+                // Replace term_index with new complete index
+                // (load_term_index already scans all blocks and collects all locations)
+                *self.term_index.write() = new_index;
             }
             
-            // Put newly written data into cache
-            // Important: merge with old cache data, don't overwrite
-            let mut cache = self.cache.lock();
-            for (term, bitmap) in entries {
-                if let Some(existing) = cache.get(&term) {
-                    let merged = existing.or(&bitmap);
-                    cache.put(term, merged);
-                } else {
-                    cache.put(term, bitmap);
-                }
-            }
+            // Clear cache to ensure subsequent searches load fresh data from term_index
+            // This is necessary because term_index now contains complete data from all blocks,
+            // while cache may only have partial data
+            self.cache.lock().clear();
         } else {
             // Full load mode: update in-memory data
             let mut data = self.data.write();

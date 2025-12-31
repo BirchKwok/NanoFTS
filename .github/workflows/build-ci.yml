@@ -56,9 +56,9 @@ jobs:
           python -m pip install pytest maturin
 
       - name: Build and install package
-        working-directory: nanofts
         run: |
-          maturin develop --release
+          chmod +x build.sh
+          ./build.sh --develop --release
 
       - name: Run tests
         run: python -m pytest test/ -v
@@ -76,6 +76,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Setup build environment
+        run: |
+          chmod +x build.sh
+          cp README.md nanofts/README.md
 
       - name: Build sdist
         uses: PyO3/maturin-action@v1
@@ -104,6 +109,9 @@ jobs:
     
     steps:
       - uses: actions/checkout@v4
+
+      - name: Setup build environment
+        run: cp README.md nanofts/README.md
 
       - name: Build wheels
         uses: PyO3/maturin-action@v1
@@ -138,6 +146,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Setup build environment
+        run: cp README.md nanofts/README.md
+
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
@@ -166,6 +177,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Setup build environment
+        run: copy README.md nanofts\README.md
 
       - name: Build wheels
         uses: PyO3/maturin-action@v1

@@ -264,6 +264,55 @@ class TestIndexRecreation:
         result = engine2.search("second")
         assert 2 in result.to_list()
     
+    def test_drop_if_exists_removes_wal_file(self, tmp_index_file):
+        """测试 drop_if_exists=True 时是否正确删除 .wal 文件"""
+        wal_file = tmp_index_file + ".wal"
+        
+        # 第一次创建并写入数据（不 flush 以保留 WAL 数据）
+        engine1 = create_engine(tmp_index_file, drop_if_exists=True)
+        engine1.add_document(1, {"content": "wal test data"})
+        engine1.flush()  # flush 后 WAL 内容会被清空但文件可能还在
+        
+        # 再添加一些数据但不 flush，确保 WAL 有内容
+        engine1.add_document(2, {"content": "unflushed wal data"})
+        
+        # 检查 WAL 文件是否存在或有内容
+        stats1 = engine1.stats()
+        del engine1
+        
+        # 确认索引文件存在
+        assert os.path.exists(tmp_index_file), "索引文件应该存在"
+        
+        # 使用 drop_if_exists=True 重新创建
+        engine2 = create_engine(tmp_index_file, drop_if_exists=True)
+        
+        # 旧数据应该被清除
+        result = engine2.search("wal")
+        assert result.total_hits == 0, "旧数据应该被清除"
+        
+        result = engine2.search("unflushed")
+        assert result.total_hits == 0, "未 flush 的数据也应该被清除"
+        
+        # WAL 文件应该被清理或重置
+        stats2 = engine2.stats()
+        assert stats2.get("wal_pending_batches", 0) == 0, "WAL pending batches 应该为 0"
+        
+        # 验证新引擎功能正常
+        engine2.add_document(3, {"content": "new wal data"})
+        engine2.flush()
+        
+        result = engine2.search("new")
+        assert 3 in result.to_list(), "新数据应该能正常添加和搜索"
+        
+        del engine2
+        
+        # 最终验证：重新打开应该只有新数据
+        engine3 = create_engine(tmp_index_file)
+        result = engine3.search("new")
+        assert result.total_hits == 1, "重新打开后应该只有新数据"
+        result = engine3.search("wal test")
+        assert result.total_hits == 0, "旧数据不应该恢复"
+    
     def test_delete_and_recreate_index_file(self, tmp_index_file):
         """测试删除索引文件后重建"""
         # 创建索引

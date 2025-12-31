@@ -172,7 +172,7 @@ impl Default for EngineStats {
 /// - Lazy load mode (large file, low memory)
 /// - Fuzzy search
 /// - Document delete/update
-#[pyclass]
+#[pyclass(subclass)]
 pub struct UnifiedEngine {
     // Storage layer
     index: Option<Arc<LsmSingleIndex>>,
