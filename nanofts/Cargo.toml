@@ -83,6 +83,9 @@ instant = "0.1"
 pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"], optional = true }
 numpy = { version = "0.22", optional = true }
 
+[dev-dependencies]
+tempfile = "3.10"
+
 [features]
 default = ["mimalloc"]
 # Python bindings feature - enables PyO3 and numpy support
