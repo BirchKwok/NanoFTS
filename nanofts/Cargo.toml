@@ -21,8 +21,8 @@ roaring = "0.10"
 # 内存映射
 memmap2 = "0.9"
 
-# 并行计算
-rayon = "1.10"
+# 并行计算 - 使用 ForkUnion 替代 rayon，更低延迟
+fork_union = "2.3"
 
 # 高性能哈希
 xxhash-rust = { version = "0.8", features = ["xxh32", "xxh64"] }

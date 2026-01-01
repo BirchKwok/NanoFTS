@@ -4,8 +4,6 @@
 
 use crate::bitmap::FastBitmap;
 use crate::index::{InvertedIndex, IndexConfig};
-use crate::simd_utils;
-use rayon::prelude::*;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::cmp::Ordering as CmpOrdering;
@@ -187,8 +185,8 @@ impl SearchEngine {
             return FastBitmap::new();
         }
         
-        // Parallel search similar terms
-        let bitmaps: Vec<FastBitmap> = similar_terms.par_iter()
+        // Search similar terms
+        let bitmaps: Vec<FastBitmap> = similar_terms.iter()
             .filter_map(|(term, _score)| {
                 let bitmap = self.index.search(term);
                 if bitmap.is_empty() {
@@ -230,8 +228,8 @@ impl SearchEngine {
             }
         };
         
-        // Parallel compute similarity
-        let mut candidates: Vec<(String, f64)> = all_terms.par_iter()
+        // Compute similarity
+        let mut candidates: Vec<(String, f64)> = all_terms.iter()
             .filter_map(|term| {
                 let term_len = term.chars().count();
                 
@@ -247,8 +245,8 @@ impl SearchEngine {
                     return None;
                 }
                 
-                // Calculate similarity
-                let similarity = simd_utils::similarity_score(query, term);
+                // Calculate similarity using simple Levenshtein-based score
+                let similarity = crate::simd_utils::similarity_score(query, term);
                 
                 if similarity >= threshold {
                     Some((term.clone(), similarity))
@@ -353,12 +351,12 @@ impl ParallelSearcher {
         Self { engines }
     }
     
-    /// Parallel search
+    /// Search across all engines
     pub fn search(&self, query: &str) -> SearchResult {
         let start = std::time::Instant::now();
         
-        // Parallel search all engines
-        let bitmaps: Vec<FastBitmap> = self.engines.par_iter()
+        // Search all engines
+        let bitmaps: Vec<FastBitmap> = self.engines.iter()
             .map(|engine| engine.search_bitmap(query))
             .collect();
         
@@ -370,12 +368,12 @@ impl ParallelSearcher {
         SearchResult::from_bitmap(merged, elapsed, false)
     }
     
-    /// Parallel fuzzy search
+    /// Fuzzy search across all engines
     pub fn fuzzy_search(&self, query: &str, min_results: usize) -> SearchResult {
         let start = std::time::Instant::now();
         
-        // Parallel search all engines
-        let results: Vec<SearchResult> = self.engines.par_iter()
+        // Search all engines
+        let results: Vec<SearchResult> = self.engines.iter()
             .map(|engine| engine.fuzzy_search(query, min_results))
             .collect();
         

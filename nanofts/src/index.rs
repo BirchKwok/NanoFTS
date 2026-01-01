@@ -6,14 +6,10 @@ use crate::bitmap::FastBitmap;
 use crate::cache::ShardedCache;
 use crate::shard::{ShardManager, ShardWriter, ShardError};
 use dashmap::DashMap;
-use parking_lot::RwLock;
-use rayon::prelude::*;
 use rustc_hash::FxHashMap;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use regex::Regex;
-use unicode_segmentation::UnicodeSegmentation;
 
 /// Index configuration
 #[derive(Clone, Debug)]
@@ -210,8 +206,8 @@ impl InvertedIndex {
             return FastBitmap::new();
         }
         
-        // Parallel get all term bitmaps
-        let bitmaps: Vec<_> = words.par_iter()
+        // Get all term bitmaps
+        let bitmaps: Vec<_> = words.iter()
             .filter_map(|word| {
                 if self.chinese_pattern.is_match(word) {
                     Some(self.search_chinese(word))
@@ -323,9 +319,9 @@ impl InvertedIndex {
                 .insert(term, bitmap);
         }
         
-        // Parallel write to shards
+        // Write to shards
         let shards_dir = index_dir.join("shards");
-        shard_buffers.par_iter().try_for_each(|(shard_id, terms)| {
+        for (shard_id, terms) in shard_buffers.iter() {
             let shard_path = shards_dir.join(format!("shard_{}.nfts", shard_id));
             let mut writer = ShardWriter::new(&shard_path);
             
@@ -347,8 +343,8 @@ impl InvertedIndex {
                 writer.merge_term(term.clone(), bitmap)?;
             }
             
-            writer.write()
-        })?;
+            writer.write()?;
+        }
         
         // Clear buffer
         self.buffer.clear();
