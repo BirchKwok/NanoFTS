@@ -2,6 +2,24 @@
 //!
 //! Replacement for PagedEngine, LsmEngine, LsmSingleEngine
 //! Supports: memory-only mode, single-file persistence, fuzzy search, document delete/update
+//!
+//! # Rust API Example
+//!
+//! ```rust
+//! use nanofts::{UnifiedEngine, EngineConfig};
+//!
+//! // Create in-memory engine
+//! let engine = UnifiedEngine::new(EngineConfig::default()).unwrap();
+//!
+//! // Add documents
+//! let mut fields = std::collections::HashMap::new();
+//! fields.insert("title".to_string(), "Hello World".to_string());
+//! engine.add_document(1, fields).unwrap();
+//!
+//! // Search
+//! let result = engine.search("hello").unwrap();
+//! println!("Found {} documents", result.total_hits());
+//! ```
 
 use crate::bitmap::FastBitmap;
 use crate::lsm_single::LsmSingleIndex;
@@ -9,14 +27,38 @@ use crate::simd_utils;
 use dashmap::DashMap;
 use fork_union::spawn;
 use parking_lot::{RwLock, Mutex};
-use pyo3::prelude::*;
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use thiserror::Error;
+
+#[cfg(feature = "python")]
+use pyo3::prelude::*;
+
+/// Engine error type
+#[derive(Error, Debug)]
+pub enum EngineError {
+    #[error("IO error: {0}")]
+    IoError(#[from] std::io::Error),
+    #[error("Index error: {0}")]
+    IndexError(String),
+    #[error("Invalid argument: {0}")]
+    InvalidArgument(String),
+}
+
+#[cfg(feature = "python")]
+impl From<EngineError> for PyErr {
+    fn from(err: EngineError) -> PyErr {
+        pyo3::exceptions::PyRuntimeError::new_err(err.to_string())
+    }
+}
+
+/// Result type for engine operations
+pub type EngineResult<T> = Result<T, EngineError>;
 
 /// Search result handle
-#[pyclass]
+#[cfg_attr(feature = "python", pyo3::pyclass)]
 #[derive(Clone)]
 pub struct ResultHandle {
     bitmap: Arc<FastBitmap>,
@@ -25,11 +67,134 @@ pub struct ResultHandle {
     fuzzy_used: bool,
 }
 
-#[pymethods]
+// Pure Rust API
+impl ResultHandle {
+    /// Create a new result handle
+    pub fn new(bitmap: FastBitmap, query: String, elapsed_ns: u64, fuzzy_used: bool) -> Self {
+        Self {
+            bitmap: Arc::new(bitmap),
+            query,
+            elapsed_ns,
+            fuzzy_used,
+        }
+    }
+    
+    /// Get total number of hits
+    pub fn total_hits(&self) -> u64 {
+        self.bitmap.len()
+    }
+    
+    /// Get elapsed time in nanoseconds
+    pub fn get_elapsed_ns(&self) -> u64 {
+        self.elapsed_ns
+    }
+    
+    /// Check if fuzzy search was used
+    pub fn is_fuzzy_used(&self) -> bool {
+        self.fuzzy_used
+    }
+    
+    /// Get elapsed time in milliseconds
+    pub fn elapsed_ms(&self) -> f64 {
+        self.elapsed_ns as f64 / 1_000_000.0
+    }
+    
+    /// Get elapsed time in microseconds
+    pub fn elapsed_us(&self) -> f64 {
+        self.elapsed_ns as f64 / 1_000.0
+    }
+    
+    /// Check if result contains document ID
+    pub fn contains(&self, doc_id: u32) -> bool {
+        self.bitmap.contains(doc_id)
+    }
+    
+    /// Check if result is empty
+    pub fn is_empty(&self) -> bool {
+        self.bitmap.is_empty()
+    }
+    
+    /// Get top N document IDs
+    pub fn top(&self, n: usize) -> Vec<u32> {
+        self.bitmap.iter().take(n).collect()
+    }
+    
+    /// Convert to vector of document IDs
+    pub fn to_list(&self) -> Vec<u32> {
+        self.bitmap.to_vec()
+    }
+    
+    /// Get page of results
+    pub fn page(&self, offset: usize, limit: usize) -> Vec<u32> {
+        self.bitmap.iter().skip(offset).take(limit).collect()
+    }
+    
+    /// Intersection with another result
+    pub fn intersect(&self, other: &ResultHandle) -> ResultHandle {
+        let start = std::time::Instant::now();
+        ResultHandle {
+            bitmap: Arc::new(self.bitmap.and(&other.bitmap)),
+            query: format!("({}) AND ({})", self.query, other.query),
+            elapsed_ns: start.elapsed().as_nanos() as u64,
+            fuzzy_used: self.fuzzy_used || other.fuzzy_used,
+        }
+    }
+    
+    /// Union with another result
+    pub fn union(&self, other: &ResultHandle) -> ResultHandle {
+        let start = std::time::Instant::now();
+        ResultHandle {
+            bitmap: Arc::new(self.bitmap.or(&other.bitmap)),
+            query: format!("({}) OR ({})", self.query, other.query),
+            elapsed_ns: start.elapsed().as_nanos() as u64,
+            fuzzy_used: self.fuzzy_used || other.fuzzy_used,
+        }
+    }
+    
+    /// Difference with another result
+    pub fn difference(&self, other: &ResultHandle) -> ResultHandle {
+        let start = std::time::Instant::now();
+        ResultHandle {
+            bitmap: Arc::new(self.bitmap.andnot(&other.bitmap)),
+            query: format!("({}) NOT ({})", self.query, other.query),
+            elapsed_ns: start.elapsed().as_nanos() as u64,
+            fuzzy_used: self.fuzzy_used,
+        }
+    }
+    
+    /// Get query string
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+    
+    /// Get length (number of hits)
+    pub fn len(&self) -> usize {
+        self.bitmap.len() as usize
+    }
+    
+    /// Get iterator over document IDs
+    pub fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+        self.bitmap.iter()
+    }
+}
+
+impl std::fmt::Display for ResultHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ResultHandle(hits={}, query='{}', elapsed={:.3}ms)",
+            self.bitmap.len(), self.query, self.elapsed_ns as f64 / 1_000_000.0
+        )
+    }
+}
+
+// Python-specific methods
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
 impl ResultHandle {
     #[getter]
-    fn total_hits(&self) -> u64 {
-        self.bitmap.len()
+    fn total_hits_py(&self) -> u64 {
+        self.total_hits()
     }
     
     #[getter]
@@ -42,106 +207,184 @@ impl ResultHandle {
         self.fuzzy_used
     }
     
-    fn elapsed_ms(&self) -> f64 {
-        self.elapsed_ns as f64 / 1_000_000.0
+    #[pyo3(name = "elapsed_ms")]
+    fn elapsed_ms_py(&self) -> f64 {
+        self.elapsed_ms()
     }
     
-    fn elapsed_us(&self) -> f64 {
-        self.elapsed_ns as f64 / 1_000.0
+    #[pyo3(name = "elapsed_us")]
+    fn elapsed_us_py(&self) -> f64 {
+        self.elapsed_us()
     }
     
-    fn contains(&self, doc_id: u32) -> bool {
-        self.bitmap.contains(doc_id)
+    #[pyo3(name = "contains")]
+    fn contains_py(&self, doc_id: u32) -> bool {
+        self.contains(doc_id)
     }
     
-    fn is_empty(&self) -> bool {
-        self.bitmap.is_empty()
+    #[pyo3(name = "is_empty")]
+    fn is_empty_py(&self) -> bool {
+        self.is_empty()
     }
     
     #[pyo3(signature = (n=100))]
-    fn top(&self, n: usize) -> Vec<u32> {
-        self.bitmap.iter().take(n).collect()
+    #[pyo3(name = "top")]
+    fn top_py(&self, n: usize) -> Vec<u32> {
+        self.top(n)
     }
     
-    fn to_list(&self) -> Vec<u32> {
-        self.bitmap.to_vec()
+    #[pyo3(name = "to_list")]
+    fn to_list_py(&self) -> Vec<u32> {
+        self.to_list()
     }
     
-    fn to_numpy<'py>(&self, py: Python<'py>) -> PyResult<pyo3::Bound<'py, numpy::PyArray1<u32>>> {
+    fn to_numpy<'py>(&self, py: pyo3::Python<'py>) -> pyo3::PyResult<pyo3::Bound<'py, numpy::PyArray1<u32>>> {
         let ids: Vec<u32> = self.bitmap.to_vec();
         Ok(numpy::PyArray1::from_vec_bound(py, ids))
     }
     
-    fn page(&self, offset: usize, limit: usize) -> Vec<u32> {
-        self.bitmap.iter().skip(offset).take(limit).collect()
+    #[pyo3(name = "page")]
+    fn page_py(&self, offset: usize, limit: usize) -> Vec<u32> {
+        self.page(offset, limit)
     }
     
-    fn intersect(&self, other: &ResultHandle) -> ResultHandle {
-        let start = std::time::Instant::now();
-        ResultHandle {
-            bitmap: Arc::new(self.bitmap.and(&other.bitmap)),
-            query: format!("({}) AND ({})", self.query, other.query),
-            elapsed_ns: start.elapsed().as_nanos() as u64,
-            fuzzy_used: self.fuzzy_used || other.fuzzy_used,
-        }
+    #[pyo3(name = "intersect")]
+    fn intersect_py(&self, other: &ResultHandle) -> ResultHandle {
+        self.intersect(other)
     }
     
-    fn union(&self, other: &ResultHandle) -> ResultHandle {
-        let start = std::time::Instant::now();
-        ResultHandle {
-            bitmap: Arc::new(self.bitmap.or(&other.bitmap)),
-            query: format!("({}) OR ({})", self.query, other.query),
-            elapsed_ns: start.elapsed().as_nanos() as u64,
-            fuzzy_used: self.fuzzy_used || other.fuzzy_used,
-        }
+    #[pyo3(name = "union")]
+    fn union_py(&self, other: &ResultHandle) -> ResultHandle {
+        self.union(other)
     }
     
-    fn difference(&self, other: &ResultHandle) -> ResultHandle {
-        let start = std::time::Instant::now();
-        ResultHandle {
-            bitmap: Arc::new(self.bitmap.andnot(&other.bitmap)),
-            query: format!("({}) NOT ({})", self.query, other.query),
-            elapsed_ns: start.elapsed().as_nanos() as u64,
-            fuzzy_used: self.fuzzy_used,
-        }
+    #[pyo3(name = "difference")]
+    fn difference_py(&self, other: &ResultHandle) -> ResultHandle {
+        self.difference(other)
     }
     
     fn __len__(&self) -> usize {
-        self.bitmap.len() as usize
+        self.len()
     }
     
     fn __repr__(&self) -> String {
-        format!(
-            "ResultHandle(hits={}, query='{}', elapsed={:.3}ms)",
-            self.bitmap.len(), self.query, self.elapsed_ns as f64 / 1_000_000.0
-        )
+        self.to_string()
     }
 }
 
 /// Fuzzy search configuration
-#[pyclass]
 #[derive(Clone)]
+#[cfg_attr(feature = "python", pyo3::pyclass(get_all, set_all))]
 pub struct FuzzyConfig {
-    #[pyo3(get, set)]
     pub threshold: f64,
-    #[pyo3(get, set)]
     pub max_distance: usize,
-    #[pyo3(get, set)]
     pub max_candidates: usize,
 }
 
-#[pymethods]
+impl FuzzyConfig {
+    /// Create new fuzzy config with default values
+    pub fn new(threshold: f64, max_distance: usize, max_candidates: usize) -> Self {
+        Self { threshold, max_distance, max_candidates }
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
 impl FuzzyConfig {
     #[new]
     #[pyo3(signature = (threshold=0.7, max_distance=2, max_candidates=20))]
-    fn new(threshold: f64, max_distance: usize, max_candidates: usize) -> Self {
-        Self { threshold, max_distance, max_candidates }
+    fn py_new(threshold: f64, max_distance: usize, max_candidates: usize) -> Self {
+        Self::new(threshold, max_distance, max_candidates)
     }
 }
 
 impl Default for FuzzyConfig {
     fn default() -> Self {
         Self { threshold: 0.7, max_distance: 2, max_candidates: 20 }
+    }
+}
+
+/// Engine configuration
+#[derive(Clone)]
+pub struct EngineConfig {
+    /// Index file path, empty for memory-only mode
+    pub index_file: String,
+    /// Maximum Chinese n-gram length
+    pub max_chinese_length: usize,
+    /// Minimum term length
+    pub min_term_length: usize,
+    /// Fuzzy search similarity threshold
+    pub fuzzy_threshold: f64,
+    /// Fuzzy search maximum edit distance
+    pub fuzzy_max_distance: usize,
+    /// Whether to track document terms (for efficient deletion)
+    pub track_doc_terms: bool,
+    /// Whether to delete existing index file
+    pub drop_if_exists: bool,
+    /// Whether to enable lazy load mode
+    pub lazy_load: bool,
+    /// LRU cache size in lazy load mode
+    pub cache_size: usize,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            index_file: String::new(),
+            max_chinese_length: 4,
+            min_term_length: 2,
+            fuzzy_threshold: 0.7,
+            fuzzy_max_distance: 2,
+            track_doc_terms: false,
+            drop_if_exists: false,
+            lazy_load: false,
+            cache_size: 10000,
+        }
+    }
+}
+
+impl EngineConfig {
+    /// Create config for memory-only mode
+    pub fn memory_only() -> Self {
+        Self::default()
+    }
+    
+    /// Create config for persistent mode
+    pub fn persistent<S: Into<String>>(index_file: S) -> Self {
+        Self {
+            index_file: index_file.into(),
+            ..Default::default()
+        }
+    }
+    
+    /// Enable lazy load mode
+    pub fn with_lazy_load(mut self, enabled: bool) -> Self {
+        self.lazy_load = enabled;
+        self
+    }
+    
+    /// Set cache size
+    pub fn with_cache_size(mut self, size: usize) -> Self {
+        self.cache_size = size;
+        self
+    }
+    
+    /// Enable document term tracking
+    pub fn with_track_doc_terms(mut self, enabled: bool) -> Self {
+        self.track_doc_terms = enabled;
+        self
+    }
+    
+    /// Set fuzzy search threshold
+    pub fn with_fuzzy_threshold(mut self, threshold: f64) -> Self {
+        self.fuzzy_threshold = threshold;
+        self
+    }
+    
+    /// Drop existing index if exists
+    pub fn with_drop_if_exists(mut self, drop: bool) -> Self {
+        self.drop_if_exists = drop;
+        self
     }
 }
 
@@ -172,7 +415,29 @@ impl Default for EngineStats {
 /// - Lazy load mode (large file, low memory)
 /// - Fuzzy search
 /// - Document delete/update
-#[pyclass(subclass)]
+///
+/// # Rust API Example
+///
+/// ```rust,no_run
+/// use nanofts::{UnifiedEngine, EngineConfig};
+/// use std::collections::HashMap;
+///
+/// let config = EngineConfig::persistent("index.nfts")
+///     .with_lazy_load(true)
+///     .with_cache_size(10000);
+///
+/// let engine = UnifiedEngine::new(config).unwrap();
+///
+/// // Add document
+/// let mut fields = HashMap::new();
+/// fields.insert("title".to_string(), "Hello World".to_string());
+/// engine.add_document(1, fields).unwrap();
+///
+/// // Search
+/// let result = engine.search("hello").unwrap();
+/// println!("Found {} results", result.total_hits());
+/// ```
+#[cfg_attr(feature = "python", pyo3::pyclass(subclass))]
 pub struct UnifiedEngine {
     // Storage layer
     index: Option<Arc<LsmSingleIndex>>,
@@ -204,33 +469,56 @@ pub struct UnifiedEngine {
     compact_lock: RwLock<()>,
 }
 
-#[pymethods]
+// Pure Rust API implementation
 impl UnifiedEngine {
-    /// Create unified search engine
-    /// 
-    /// Args:
-    ///     index_file: Index file path, empty string for memory-only mode
-    ///     max_chinese_length: Maximum Chinese n-gram length
-    ///     min_term_length: Minimum term length
-    ///     fuzzy_threshold: Fuzzy search similarity threshold
-    ///     fuzzy_max_distance: Fuzzy search maximum edit distance
-    ///     track_doc_terms: Whether to track document terms (for efficient deletion)
-    ///     drop_if_exists: Whether to delete existing index file
-    ///     lazy_load: Whether to enable lazy load mode (large file, low memory)
-    ///     cache_size: LRU cache size in lazy load mode
-    #[new]
-    #[pyo3(signature = (
-        index_file="".to_string(),
-        max_chinese_length=4,
-        min_term_length=2,
-        fuzzy_threshold=0.7,
-        fuzzy_max_distance=2,
-        track_doc_terms=false,
-        drop_if_exists=false,
-        lazy_load=false,
-        cache_size=10000
-    ))]
-    fn new(
+    /// Create unified search engine with configuration
+    pub fn new(config: EngineConfig) -> EngineResult<Self> {
+        let memory_only = config.index_file.is_empty();
+        
+        let index = if memory_only {
+            None
+        } else {
+            let path = std::path::PathBuf::from(&config.index_file);
+            
+            let idx = if path.exists() && config.drop_if_exists {
+                std::fs::remove_file(&path)?;
+                LsmSingleIndex::create_full_options(&path, true, config.lazy_load, config.cache_size)
+            } else if path.exists() {
+                LsmSingleIndex::open_full_options(&path, true, config.lazy_load, config.cache_size)
+            } else {
+                LsmSingleIndex::create_full_options(&path, true, config.lazy_load, config.cache_size)
+            }.map_err(|e| EngineError::IndexError(e.to_string()))?;
+            
+            Some(Arc::new(idx))
+        };
+        
+        Ok(Self {
+            index,
+            buffer: DashMap::new(),
+            doc_terms: DashMap::new(),
+            track_doc_terms: config.track_doc_terms,
+            deleted_docs: DashMap::new(),
+            updated_docs: DashMap::new(),
+            max_chinese_length: config.max_chinese_length,
+            min_term_length: config.min_term_length,
+            fuzzy_config: RwLock::new(FuzzyConfig {
+                threshold: config.fuzzy_threshold,
+                max_distance: config.fuzzy_max_distance,
+                max_candidates: 20,
+            }),
+            result_cache: DashMap::new(),
+            cache_enabled: true,
+            stats: EngineStats::default(),
+            memory_only,
+            lazy_load: config.lazy_load,
+            preloaded: std::sync::atomic::AtomicBool::new(false),
+            chinese_pattern: regex::Regex::new(r"[\u4e00-\u9fff]+").unwrap(),
+            compact_lock: RwLock::new(()),
+        })
+    }
+    
+    /// Create engine from raw parameters (used by Python bindings)
+    pub fn new_with_params(
         index_file: String,
         max_chinese_length: usize,
         min_term_length: usize,
@@ -240,56 +528,24 @@ impl UnifiedEngine {
         drop_if_exists: bool,
         lazy_load: bool,
         cache_size: usize,
-    ) -> PyResult<Self> {
-        let memory_only = index_file.is_empty();
-        
-        let index = if memory_only {
-            None
-        } else {
-            let path = std::path::PathBuf::from(&index_file);
-            
-            let idx = if path.exists() && drop_if_exists {
-                std::fs::remove_file(&path)
-                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-                LsmSingleIndex::create_full_options(&path, true, lazy_load, cache_size)
-            } else if path.exists() {
-                LsmSingleIndex::open_full_options(&path, true, lazy_load, cache_size)
-            } else {
-                LsmSingleIndex::create_full_options(&path, true, lazy_load, cache_size)
-            }.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-            
-            Some(Arc::new(idx))
-        };
-        
-        Ok(Self {
-            index,
-            buffer: DashMap::new(),
-            doc_terms: DashMap::new(),
-            track_doc_terms,
-            deleted_docs: DashMap::new(),
-            updated_docs: DashMap::new(),
+    ) -> EngineResult<Self> {
+        Self::new(EngineConfig {
+            index_file,
             max_chinese_length,
             min_term_length,
-            fuzzy_config: RwLock::new(FuzzyConfig {
-                threshold: fuzzy_threshold,
-                max_distance: fuzzy_max_distance,
-                max_candidates: 20,
-            }),
-            result_cache: DashMap::new(),
-            cache_enabled: true,
-            stats: EngineStats::default(),
-            memory_only,
+            fuzzy_threshold,
+            fuzzy_max_distance,
+            track_doc_terms,
+            drop_if_exists,
             lazy_load,
-            preloaded: std::sync::atomic::AtomicBool::new(false),
-            chinese_pattern: regex::Regex::new(r"[\u4e00-\u9fff]+").unwrap(),
-            compact_lock: RwLock::new(()),
+            cache_size,
         })
     }
     
     // ==================== Document Operations ====================
     
     /// Add single document
-    fn add_document(&self, doc_id: u32, fields: HashMap<String, String>) -> PyResult<()> {
+    pub fn add_document(&self, doc_id: u32, fields: HashMap<String, String>) -> EngineResult<()> {
         // If previously deleted, remove from deleted_docs
         self.deleted_docs.remove(&doc_id);
         // Also remove from updated_docs (may have been updated before)
@@ -304,7 +560,7 @@ impl UnifiedEngine {
     }
     
     /// Batch add documents - optimized parallel version using ForkUnion
-    fn add_documents(&self, docs: Vec<(u32, HashMap<String, String>)>) -> PyResult<usize> {
+    pub fn add_documents(&self, docs: Vec<(u32, HashMap<String, String>)>) -> EngineResult<usize> {
         let count = docs.len();
         if count == 0 {
             return Ok(0);
@@ -324,12 +580,7 @@ impl UnifiedEngine {
     }
     
     /// Update document
-    /// 
-    /// Update document content. After update:
-    /// - Old content no longer searchable (removed from buffer, index data marked ignored)
-    /// - New content is searchable (in buffer)
-    /// - Call compact() to actually remove old data from index
-    fn update_document(&self, doc_id: u32, fields: HashMap<String, String>) -> PyResult<()> {
+    pub fn update_document(&self, doc_id: u32, fields: HashMap<String, String>) -> EngineResult<()> {
         // 1. Mark document as "updated" (ignore old data in index during search)
         self.updated_docs.insert(doc_id, ());
         
@@ -358,9 +609,7 @@ impl UnifiedEngine {
     }
     
     /// Delete document
-    /// 
-    /// Uses tombstone mechanism, deleted documents automatically excluded from search
-    fn remove_document(&self, doc_id: u32) -> PyResult<()> {
+    pub fn remove_document(&self, doc_id: u32) -> EngineResult<()> {
         // Add tombstone marker
         self.deleted_docs.insert(doc_id, ());
         
@@ -380,7 +629,7 @@ impl UnifiedEngine {
     }
     
     /// Batch delete documents
-    fn remove_documents(&self, doc_ids: Vec<u32>) -> PyResult<()> {
+    pub fn remove_documents(&self, doc_ids: Vec<u32>) -> EngineResult<()> {
         for doc_id in doc_ids {
             self.remove_document(doc_id)?;
         }
@@ -390,7 +639,7 @@ impl UnifiedEngine {
     // ==================== Search Operations ====================
     
     /// Search
-    fn search(&self, query: &str) -> PyResult<ResultHandle> {
+    pub fn search(&self, query: &str) -> EngineResult<ResultHandle> {
         let start = std::time::Instant::now();
         self.stats.search_count.fetch_add(1, Ordering::Relaxed);
         
@@ -426,8 +675,7 @@ impl UnifiedEngine {
     }
     
     /// Fuzzy search
-    #[pyo3(signature = (query, min_results=5))]
-    fn fuzzy_search(&self, query: &str, min_results: usize) -> PyResult<ResultHandle> {
+    pub fn fuzzy_search(&self, query: &str, min_results: usize) -> EngineResult<ResultHandle> {
         let start = std::time::Instant::now();
         self.stats.fuzzy_search_count.fetch_add(1, Ordering::Relaxed);
         
@@ -454,7 +702,7 @@ impl UnifiedEngine {
     }
     
     /// Batch search - optimized parallel version using ForkUnion
-    fn search_batch(&self, queries: Vec<String>) -> PyResult<Vec<ResultHandle>> {
+    pub fn search_batch(&self, queries: Vec<String>) -> EngineResult<Vec<ResultHandle>> {
         let num_queries = queries.len();
         if num_queries == 0 {
             return Ok(Vec::new());
@@ -476,13 +724,13 @@ impl UnifiedEngine {
         pool.for_n(num_queries, |prong| {
             let idx = prong.task_index;
             let q = &queries[idx];
-                let start = std::time::Instant::now();
-                let bitmap = Arc::new(self.search_internal(q));
+            let start = std::time::Instant::now();
+            let bitmap = Arc::new(self.search_internal(q));
             let handle = ResultHandle {
-                    bitmap,
-                    query: q.clone(),
-                    elapsed_ns: start.elapsed().as_nanos() as u64,
-                    fuzzy_used: false,
+                bitmap,
+                query: q.clone(),
+                elapsed_ns: start.elapsed().as_nanos() as u64,
+                fuzzy_used: false,
             };
             *results[idx].lock() = Some(handle);
         });
@@ -497,7 +745,7 @@ impl UnifiedEngine {
     }
     
     /// AND search
-    fn search_and(&self, queries: Vec<String>) -> PyResult<ResultHandle> {
+    pub fn search_and(&self, queries: Vec<String>) -> EngineResult<ResultHandle> {
         let start = std::time::Instant::now();
         
         let mut result: Option<FastBitmap> = None;
@@ -521,7 +769,7 @@ impl UnifiedEngine {
     }
     
     /// OR search
-    fn search_or(&self, queries: Vec<String>) -> PyResult<ResultHandle> {
+    pub fn search_or(&self, queries: Vec<String>) -> EngineResult<ResultHandle> {
         let start = std::time::Instant::now();
         
         let mut result = FastBitmap::new();
@@ -539,7 +787,7 @@ impl UnifiedEngine {
     }
     
     /// Filter results
-    fn filter_by_ids(&self, result: &ResultHandle, allowed_ids: Vec<u32>) -> PyResult<ResultHandle> {
+    pub fn filter_by_ids(&self, result: &ResultHandle, allowed_ids: Vec<u32>) -> EngineResult<ResultHandle> {
         let start = std::time::Instant::now();
         let filter = FastBitmap::from_iter(allowed_ids);
         let filtered = result.bitmap.and(&filter);
@@ -553,7 +801,7 @@ impl UnifiedEngine {
     }
     
     /// Exclude IDs
-    fn exclude_ids(&self, result: &ResultHandle, excluded_ids: Vec<u32>) -> PyResult<ResultHandle> {
+    pub fn exclude_ids(&self, result: &ResultHandle, excluded_ids: Vec<u32>) -> EngineResult<ResultHandle> {
         let start = std::time::Instant::now();
         let exclude = FastBitmap::from_iter(excluded_ids);
         let filtered = result.bitmap.andnot(&exclude);
@@ -568,16 +816,16 @@ impl UnifiedEngine {
     
     // ==================== Configuration Operations ====================
     
-    #[pyo3(signature = (threshold=0.7, max_distance=2, max_candidates=20))]
-    fn set_fuzzy_config(&self, threshold: f64, max_distance: usize, max_candidates: usize) -> PyResult<()> {
+    /// Set fuzzy search configuration
+    pub fn set_fuzzy_config(&self, threshold: f64, max_distance: usize, max_candidates: usize) {
         let mut config = self.fuzzy_config.write();
         config.threshold = threshold;
         config.max_distance = max_distance;
         config.max_candidates = max_candidates;
-        Ok(())
     }
     
-    fn get_fuzzy_config(&self) -> HashMap<String, f64> {
+    /// Get fuzzy search configuration
+    pub fn get_fuzzy_config(&self) -> HashMap<String, f64> {
         let config = self.fuzzy_config.read();
         let mut map = HashMap::new();
         map.insert("threshold".to_string(), config.threshold);
@@ -589,10 +837,7 @@ impl UnifiedEngine {
     // ==================== Persistence Operations ====================
     
     /// Flush to disk
-    /// 
-    /// Persist memory buffer data to index file
-    /// After successful flush, buffer is cleared to avoid duplicate writes
-    fn flush(&self) -> PyResult<usize> {
+    pub fn flush(&self) -> EngineResult<usize> {
         if self.memory_only {
             return Ok(0);
         }
@@ -601,8 +846,7 @@ impl UnifiedEngine {
         let _lock = self.compact_lock.read();
         
         if let Some(ref index) = self.index {
-            // Collect all doc_ids and data from buffer (these documents' new data will be written to index)
-            // Note: use remove instead of iter to avoid concurrency issues
+            // Collect all doc_ids and data from buffer
             let mut flushed_doc_ids = std::collections::HashSet::new();
             let mut entries: Vec<(String, FastBitmap)> = Vec::new();
             
@@ -622,10 +866,8 @@ impl UnifiedEngine {
             if !entries.is_empty() {
                 index.upsert_batch(entries);
                 index.flush()
-                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+                    .map_err(|e| EngineError::IndexError(e.to_string()))?;
                 
-                // For doc_ids written in this flush, remove from updated_docs
-                // So subsequent searches correctly return their new data
                 for doc_id in flushed_doc_ids {
                     self.updated_docs.remove(&doc_id);
                 }
@@ -638,24 +880,23 @@ impl UnifiedEngine {
     }
     
     /// Save (same as flush)
-    fn save(&self) -> PyResult<usize> {
+    pub fn save(&self) -> EngineResult<usize> {
         self.flush()
     }
     
     /// Load (no-op, data is loaded on open)
-    fn load(&self) -> PyResult<()> {
+    pub fn load(&self) -> EngineResult<()> {
         self.result_cache.clear();
         Ok(())
     }
     
     /// Preload
-    fn preload(&self) -> PyResult<usize> {
+    pub fn preload(&self) -> EngineResult<usize> {
         if self.memory_only || self.preloaded.load(Ordering::Relaxed) {
             return Ok(0);
         }
         
         if let Some(ref index) = self.index {
-            // Data is already loaded in index, mark as preloaded
             self.preloaded.store(true, Ordering::Relaxed);
             Ok(index.term_count())
         } else {
@@ -663,14 +904,11 @@ impl UnifiedEngine {
         }
     }
     
-    /// Compact (also applies deletions, making them persistent)
-    fn compact(&self) -> PyResult<()> {
+    /// Compact (also applies deletions)
+    pub fn compact(&self) -> EngineResult<()> {
         if let Some(ref index) = self.index {
-            // Get write lock to block other flush operations
             let _lock = self.compact_lock.write();
             
-            // Step 1: Save buffer data but don't flush immediately
-            // For updated documents, we need to delete old data first
             let mut pending_entries: Vec<(String, FastBitmap)> = Vec::new();
             let mut flushed_doc_ids = std::collections::HashSet::new();
             {
@@ -685,31 +923,24 @@ impl UnifiedEngine {
                 }
             }
             
-            // Step 2: Collect doc_ids to delete (including actually deleted and updated)
-            // Updated documents need old term associations removed from index
             let deleted: Vec<u32> = self.deleted_docs.iter()
                 .map(|e| *e.key())
                 .chain(self.updated_docs.iter().map(|e| *e.key()))
                 .collect();
             
-            // Step 3: Execute compact and apply deletions (removes old data)
             index.compact_with_deletions(&deleted)
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(|e| EngineError::IndexError(e.to_string()))?;
             
-            // Step 4: Now flush new data (updated document content)
             if !pending_entries.is_empty() {
                 index.upsert_batch(pending_entries);
                 index.flush()
-                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+                    .map_err(|e| EngineError::IndexError(e.to_string()))?;
             }
             
-            // Clean up state
             for doc_id in flushed_doc_ids {
                 self.updated_docs.remove(&doc_id);
             }
             
-            // After compact, process data added to buffer during compact
-            // Note: other threads may have added data to buffer during compact_with_deletions
             {
                 let mut flushed_doc_ids = std::collections::HashSet::new();
                 let mut entries: Vec<(String, FastBitmap)> = Vec::new();
@@ -727,7 +958,7 @@ impl UnifiedEngine {
                 if !entries.is_empty() {
                     index.upsert_batch(entries);
                     index.flush()
-                        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+                        .map_err(|e| EngineError::IndexError(e.to_string()))?;
                     
                     for doc_id in flushed_doc_ids {
                         self.updated_docs.remove(&doc_id);
@@ -735,7 +966,6 @@ impl UnifiedEngine {
                 }
             }
             
-            // Clear tombstones and update markers (persisted now)
             self.deleted_docs.clear();
             self.updated_docs.clear();
         }
@@ -744,47 +974,57 @@ impl UnifiedEngine {
     
     // ==================== Cache Operations ====================
     
-    fn clear_cache(&self) {
+    /// Clear result cache
+    pub fn clear_cache(&self) {
         self.result_cache.clear();
     }
     
-    fn clear_doc_terms(&self) {
+    /// Clear doc terms
+    pub fn clear_doc_terms(&self) {
         self.doc_terms.clear();
     }
     
     // ==================== Statistics Operations ====================
     
-    fn is_memory_only(&self) -> bool {
+    /// Check if memory only mode
+    pub fn is_memory_only(&self) -> bool {
         self.memory_only
     }
     
-    fn term_count(&self) -> usize {
+    /// Get term count
+    pub fn term_count(&self) -> usize {
         let buffer_count = self.buffer.len();
         let index_count = self.index.as_ref().map_or(0, |i| i.term_count());
         buffer_count + index_count
     }
     
-    fn buffer_size(&self) -> usize {
+    /// Get buffer size
+    pub fn buffer_size(&self) -> usize {
         self.buffer.len()
     }
     
-    fn doc_terms_size(&self) -> usize {
+    /// Get doc terms size
+    pub fn doc_terms_size(&self) -> usize {
         self.doc_terms.len()
     }
     
-    fn page_count(&self) -> usize {
+    /// Get page count
+    pub fn page_count(&self) -> usize {
         self.index.as_ref().map_or(0, |i| i.segment_count())
     }
     
-    fn segment_count(&self) -> usize {
+    /// Get segment count
+    pub fn segment_count(&self) -> usize {
         self.index.as_ref().map_or(0, |i| i.segment_count())
     }
     
-    fn memtable_size(&self) -> usize {
+    /// Get memtable size
+    pub fn memtable_size(&self) -> usize {
         self.index.as_ref().map_or(0, |i| i.memtable_size())
     }
     
-    fn stats(&self) -> HashMap<String, f64> {
+    /// Get statistics
+    pub fn stats(&self) -> HashMap<String, f64> {
         let search_count = self.stats.search_count.load(Ordering::Relaxed);
         let cache_hits = self.stats.cache_hits.load(Ordering::Relaxed);
         let total_ns = self.stats.total_search_ns.load(Ordering::Relaxed);
@@ -806,13 +1046,11 @@ impl UnifiedEngine {
         map.insert("lazy_load".to_string(), if self.lazy_load { 1.0 } else { 0.0 });
         map.insert("track_doc_terms".to_string(), if self.track_doc_terms { 1.0 } else { 0.0 });
         
-        // WAL and lazy load statistics
         if let Some(ref index) = self.index {
             map.insert("wal_enabled".to_string(), if index.is_wal_enabled() { 1.0 } else { 0.0 });
             map.insert("wal_size".to_string(), index.wal_size() as f64);
             map.insert("wal_pending_batches".to_string(), index.wal_pending_batches() as f64);
             
-            // Lazy load cache statistics
             if index.is_lazy_load() {
                 let (lru_hits, lru_misses, lru_size) = index.cache_stats();
                 map.insert("lru_cache_hits".to_string(), lru_hits as f64);
@@ -826,17 +1064,17 @@ impl UnifiedEngine {
     }
     
     /// Get deleted document count
-    fn deleted_count(&self) -> usize {
+    pub fn deleted_count(&self) -> usize {
         self.deleted_docs.len()
     }
     
     /// Whether lazy load is enabled
-    fn is_lazy_load(&self) -> bool {
+    pub fn is_lazy_load(&self) -> bool {
         self.lazy_load
     }
     
-    /// Warmup cache (load specified terms into cache in lazy load mode)
-    fn warmup_terms(&self, terms: Vec<String>) -> usize {
+    /// Warmup cache
+    pub fn warmup_terms(&self, terms: Vec<String>) -> usize {
         if let Some(ref index) = self.index {
             index.warmup(&terms)
         } else {
@@ -844,23 +1082,238 @@ impl UnifiedEngine {
         }
     }
     
-    /// Clear LRU cache (lazy load mode)
-    fn clear_lru_cache(&self) {
+    /// Clear LRU cache
+    pub fn clear_lru_cache(&self) {
         if let Some(ref index) = self.index {
             index.clear_cache();
         }
     }
-    
-    fn __repr__(&self) -> String {
+}
+
+impl std::fmt::Display for UnifiedEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.memory_only {
-            format!("UnifiedEngine(memory_only=True, terms={})", self.term_count())
+            write!(f, "UnifiedEngine(memory_only=true, terms={})", self.term_count())
         } else if self.lazy_load {
-            format!("UnifiedEngine(lazy_load=True, terms={}, segments={})", 
+            write!(f, "UnifiedEngine(lazy_load=true, terms={}, segments={})", 
                 self.term_count(), self.segment_count())
         } else {
-            format!("UnifiedEngine(terms={}, segments={})", 
+            write!(f, "UnifiedEngine(terms={}, segments={})", 
                 self.term_count(), self.segment_count())
         }
+    }
+}
+
+// Python bindings
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl UnifiedEngine {
+    #[new]
+    #[pyo3(signature = (
+        index_file="".to_string(),
+        max_chinese_length=4,
+        min_term_length=2,
+        fuzzy_threshold=0.7,
+        fuzzy_max_distance=2,
+        track_doc_terms=false,
+        drop_if_exists=false,
+        lazy_load=false,
+        cache_size=10000
+    ))]
+    fn py_new(
+        index_file: String,
+        max_chinese_length: usize,
+        min_term_length: usize,
+        fuzzy_threshold: f64,
+        fuzzy_max_distance: usize,
+        track_doc_terms: bool,
+        drop_if_exists: bool,
+        lazy_load: bool,
+        cache_size: usize,
+    ) -> pyo3::PyResult<Self> {
+        Self::new_with_params(
+            index_file,
+            max_chinese_length,
+            min_term_length,
+            fuzzy_threshold,
+            fuzzy_max_distance,
+            track_doc_terms,
+            drop_if_exists,
+            lazy_load,
+            cache_size,
+        ).map_err(Into::into)
+    }
+    
+    #[pyo3(name = "add_document")]
+    fn add_document_py(&self, doc_id: u32, fields: HashMap<String, String>) -> pyo3::PyResult<()> {
+        self.add_document(doc_id, fields).map_err(Into::into)
+    }
+    
+    #[pyo3(name = "add_documents")]
+    fn add_documents_py(&self, docs: Vec<(u32, HashMap<String, String>)>) -> pyo3::PyResult<usize> {
+        self.add_documents(docs).map_err(Into::into)
+    }
+    
+    #[pyo3(name = "update_document")]
+    fn update_document_py(&self, doc_id: u32, fields: HashMap<String, String>) -> pyo3::PyResult<()> {
+        self.update_document(doc_id, fields).map_err(Into::into)
+    }
+    
+    #[pyo3(name = "remove_document")]
+    fn remove_document_py(&self, doc_id: u32) -> pyo3::PyResult<()> {
+        self.remove_document(doc_id).map_err(Into::into)
+    }
+    
+    #[pyo3(name = "remove_documents")]
+    fn remove_documents_py(&self, doc_ids: Vec<u32>) -> pyo3::PyResult<()> {
+        self.remove_documents(doc_ids).map_err(Into::into)
+    }
+    
+    #[pyo3(name = "search")]
+    fn search_py(&self, query: &str) -> pyo3::PyResult<ResultHandle> {
+        self.search(query).map_err(Into::into)
+    }
+    
+    #[pyo3(signature = (query, min_results=5))]
+    #[pyo3(name = "fuzzy_search")]
+    fn fuzzy_search_py(&self, query: &str, min_results: usize) -> pyo3::PyResult<ResultHandle> {
+        self.fuzzy_search(query, min_results).map_err(Into::into)
+    }
+    
+    #[pyo3(name = "search_batch")]
+    fn search_batch_py(&self, queries: Vec<String>) -> pyo3::PyResult<Vec<ResultHandle>> {
+        self.search_batch(queries).map_err(Into::into)
+    }
+    
+    #[pyo3(name = "search_and")]
+    fn search_and_py(&self, queries: Vec<String>) -> pyo3::PyResult<ResultHandle> {
+        self.search_and(queries).map_err(Into::into)
+    }
+    
+    #[pyo3(name = "search_or")]
+    fn search_or_py(&self, queries: Vec<String>) -> pyo3::PyResult<ResultHandle> {
+        self.search_or(queries).map_err(Into::into)
+    }
+    
+    #[pyo3(name = "filter_by_ids")]
+    fn filter_by_ids_py(&self, result: &ResultHandle, allowed_ids: Vec<u32>) -> pyo3::PyResult<ResultHandle> {
+        self.filter_by_ids(result, allowed_ids).map_err(Into::into)
+    }
+    
+    #[pyo3(name = "exclude_ids")]
+    fn exclude_ids_py(&self, result: &ResultHandle, excluded_ids: Vec<u32>) -> pyo3::PyResult<ResultHandle> {
+        self.exclude_ids(result, excluded_ids).map_err(Into::into)
+    }
+    
+    #[pyo3(signature = (threshold=0.7, max_distance=2, max_candidates=20))]
+    #[pyo3(name = "set_fuzzy_config")]
+    fn set_fuzzy_config_py(&self, threshold: f64, max_distance: usize, max_candidates: usize) -> pyo3::PyResult<()> {
+        self.set_fuzzy_config(threshold, max_distance, max_candidates);
+        Ok(())
+    }
+    
+    #[pyo3(name = "get_fuzzy_config")]
+    fn get_fuzzy_config_py(&self) -> HashMap<String, f64> {
+        self.get_fuzzy_config()
+    }
+    
+    #[pyo3(name = "flush")]
+    fn flush_py(&self) -> pyo3::PyResult<usize> {
+        self.flush().map_err(Into::into)
+    }
+    
+    #[pyo3(name = "save")]
+    fn save_py(&self) -> pyo3::PyResult<usize> {
+        self.save().map_err(Into::into)
+    }
+    
+    #[pyo3(name = "load")]
+    fn load_py(&self) -> pyo3::PyResult<()> {
+        self.load().map_err(Into::into)
+    }
+    
+    #[pyo3(name = "preload")]
+    fn preload_py(&self) -> pyo3::PyResult<usize> {
+        self.preload().map_err(Into::into)
+    }
+    
+    #[pyo3(name = "compact")]
+    fn compact_py(&self) -> pyo3::PyResult<()> {
+        self.compact().map_err(Into::into)
+    }
+    
+    #[pyo3(name = "clear_cache")]
+    fn clear_cache_py(&self) {
+        self.clear_cache()
+    }
+    
+    #[pyo3(name = "clear_doc_terms")]
+    fn clear_doc_terms_py(&self) {
+        self.clear_doc_terms()
+    }
+    
+    #[pyo3(name = "is_memory_only")]
+    fn is_memory_only_py(&self) -> bool {
+        self.is_memory_only()
+    }
+    
+    #[pyo3(name = "term_count")]
+    fn term_count_py(&self) -> usize {
+        self.term_count()
+    }
+    
+    #[pyo3(name = "buffer_size")]
+    fn buffer_size_py(&self) -> usize {
+        self.buffer_size()
+    }
+    
+    #[pyo3(name = "doc_terms_size")]
+    fn doc_terms_size_py(&self) -> usize {
+        self.doc_terms_size()
+    }
+    
+    #[pyo3(name = "page_count")]
+    fn page_count_py(&self) -> usize {
+        self.page_count()
+    }
+    
+    #[pyo3(name = "segment_count")]
+    fn segment_count_py(&self) -> usize {
+        self.segment_count()
+    }
+    
+    #[pyo3(name = "memtable_size")]
+    fn memtable_size_py(&self) -> usize {
+        self.memtable_size()
+    }
+    
+    #[pyo3(name = "stats")]
+    fn stats_py(&self) -> HashMap<String, f64> {
+        self.stats()
+    }
+    
+    #[pyo3(name = "deleted_count")]
+    fn deleted_count_py(&self) -> usize {
+        self.deleted_count()
+    }
+    
+    #[pyo3(name = "is_lazy_load")]
+    fn is_lazy_load_py(&self) -> bool {
+        self.is_lazy_load()
+    }
+    
+    #[pyo3(name = "warmup_terms")]
+    fn warmup_terms_py(&self, terms: Vec<String>) -> usize {
+        self.warmup_terms(terms)
+    }
+    
+    #[pyo3(name = "clear_lru_cache")]
+    fn clear_lru_cache_py(&self) {
+        self.clear_lru_cache()
+    }
+    
+    fn __repr__(&self) -> String {
+        self.to_string()
     }
 }
 
@@ -1271,29 +1724,29 @@ impl UnifiedEngine {
     }
 }
 
-/// Create unified search engine
-/// 
-/// Args:
-///     index_file: Index file path, empty string for memory-only mode
-///     max_chinese_length: Maximum Chinese n-gram length (default 4)
-///     min_term_length: Minimum term length (default 2)
-///     fuzzy_threshold: Fuzzy search similarity threshold (default 0.7)
-///     fuzzy_max_distance: Fuzzy search maximum edit distance (default 2)
-///     track_doc_terms: Whether to track document terms (default False)
-///     drop_if_exists: Whether to delete existing index file (default False)
-///     lazy_load: Whether to enable lazy load mode (default True)
-///     cache_size: LRU cache size in lazy load mode (default 10000)
-/// 
-/// Returns:
-///     UnifiedEngine: Search engine instance
-/// 
-/// Example:
-///     # Default mode (lazy load, recommended)
-///     engine = create_engine("index.nfts")
-///     
-///     # Full load mode (suitable for small indexes)
-///     engine = create_engine("index.nfts", lazy_load=False)
-#[pyfunction]
+/// Create unified search engine (Rust API)
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use nanofts::{create_engine, EngineConfig};
+///
+/// // Memory-only mode
+/// let engine = create_engine(EngineConfig::memory_only()).unwrap();
+///
+/// // Persistent mode with lazy load
+/// let engine = create_engine(
+///     EngineConfig::persistent("index.nfts")
+///         .with_lazy_load(true)
+/// ).unwrap();
+/// ```
+pub fn create_engine(config: EngineConfig) -> EngineResult<UnifiedEngine> {
+    UnifiedEngine::new(config)
+}
+
+/// Python-specific create_engine function
+#[cfg(feature = "python")]
+#[pyo3::pyfunction]
 #[pyo3(signature = (
     index_file="".to_string(),
     max_chinese_length=4,
@@ -1305,7 +1758,7 @@ impl UnifiedEngine {
     lazy_load=false,
     cache_size=10000
 ))]
-pub fn create_engine(
+pub fn create_engine_py(
     index_file: String,
     max_chinese_length: usize,
     min_term_length: usize,
@@ -1315,8 +1768,8 @@ pub fn create_engine(
     drop_if_exists: bool,
     lazy_load: bool,
     cache_size: usize,
-) -> PyResult<UnifiedEngine> {
-    UnifiedEngine::new(
+) -> pyo3::PyResult<UnifiedEngine> {
+    UnifiedEngine::new_with_params(
         index_file,
         max_chinese_length,
         min_term_length,
@@ -1326,5 +1779,5 @@ pub fn create_engine(
         drop_if_exists,
         lazy_load,
         cache_size,
-    )
+    ).map_err(Into::into)
 }

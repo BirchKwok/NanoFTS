@@ -2,6 +2,10 @@
 
 A high-performance full-text search engine with Rust core, featuring efficient indexing and searching capabilities for both English and Chinese text.
 
+[![Crates.io](https://img.shields.io/crates/v/nanofts.svg)](https://crates.io/crates/nanofts)
+[![Documentation](https://docs.rs/nanofts/badge.svg)](https://docs.rs/nanofts)
+[![PyPI](https://img.shields.io/pypi/v/nanofts.svg)](https://pypi.org/project/nanofts/)
+
 ## Features
 
 - **High Performance**: Rust-powered core with sub-millisecond search latency
@@ -10,19 +14,95 @@ A high-performance full-text search engine with Rust core, featuring efficient i
 - **Fuzzy Search**: Intelligent fuzzy matching with configurable thresholds
 - **Full CRUD**: Complete document management operations
 - **Result Handle**: Zero-copy result with set operations (AND/OR/NOT)
-- **NumPy Support**: Direct numpy array output
+- **NumPy Support**: Direct numpy array output (Python only)
 - **Multilingual**: Support for both English and Chinese text
 - **Persistence**: Disk-based storage with WAL recovery
 - **LRU Cache**: Built-in caching for frequently accessed terms
-- **Data Import**: Import from pandas, polars, arrow, parquet, CSV, JSON
+- **Data Import**: Import from pandas, polars, arrow, parquet, CSV, JSON (Python only)
+- **Dual API**: Available as both Rust crate and Python package
 
 ## Installation
+
+### Rust (Cargo)
+
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+nanofts = "0.3"
+```
+
+### Python (pip)
 
 ```bash
 pip install nanofts
 ```
 
-## Quick Start
+## Rust Quick Start
+
+```rust
+use nanofts::{UnifiedEngine, EngineConfig, EngineResult};
+use std::collections::HashMap;
+
+fn main() -> EngineResult<()> {
+    // Create an in-memory search engine
+    let engine = UnifiedEngine::new(EngineConfig::memory_only())?;
+
+    // Add a document
+    let mut fields = HashMap::new();
+    fields.insert("title".to_string(), "Hello World".to_string());
+    fields.insert("content".to_string(), "This is a test document".to_string());
+    engine.add_document(1, fields)?;
+
+    // Search
+    let result = engine.search("hello")?;
+    println!("Found {} documents", result.total_hits());
+
+    // Get document IDs
+    for doc_id in result.iter() {
+        println!("Document ID: {}", doc_id);
+    }
+
+    Ok(())
+}
+```
+
+### Persistent Storage (Rust)
+
+```rust
+use nanofts::{UnifiedEngine, EngineConfig};
+
+// Create a persistent search engine
+let config = EngineConfig::persistent("my_index.nfts")
+    .with_lazy_load(true)       // Enable lazy loading for large indexes
+    .with_cache_size(10000);    // LRU cache size
+
+let engine = UnifiedEngine::new(config)?;
+
+// ... add documents and search ...
+
+// Flush to disk
+engine.flush()?;
+```
+
+### Boolean Search Operations (Rust)
+
+```rust
+// AND search
+let result = engine.search_and(vec!["rust".to_string(), "programming".to_string()])?;
+
+// OR search  
+let result = engine.search_or(vec!["rust".to_string(), "python".to_string()])?;
+
+// Result set operations
+let result1 = engine.search("rust")?;
+let result2 = engine.search("python")?;
+let intersection = result1.intersect(&result2);
+let union = result1.union(&result2);
+let difference = result1.difference(&result2);
+```
+
+## Python Quick Start
 
 ```python
 from nanofts import create_engine
@@ -358,6 +438,35 @@ Key differences:
 - Search returns `ResultHandle` instead of `List[int]`
 - Call `.to_list()` to get document IDs
 - Use `compact()` to persist deletions
+
+## Cargo Features
+
+| Feature | Description | Default |
+|---------|-------------|---------|
+| `python` | Enable Python bindings via PyO3 | No |
+| `simd` | Enable SIMD acceleration (requires nightly) | No |
+| `mimalloc` | Use mimalloc allocator | Yes |
+
+### Building with Python Support
+
+```bash
+# Build with Python bindings
+cargo build --features python
+
+# Build Python wheel with maturin
+maturin build --release --features python
+```
+
+## Publishing to crates.io
+
+```bash
+# Login to crates.io (first time only)
+cargo login
+
+# Publish the crate
+cd nanofts
+cargo publish
+```
 
 ## License
 

@@ -6,15 +6,24 @@ authors = ["Birch Kwok"]
 description = "High-performance full-text search engine in Rust"
 license = "Apache-2.0"
 rust-version = "1.75"
+repository = "https://github.com/BirchKwok/NanoFTS"
+homepage = "https://github.com/BirchKwok/NanoFTS"
+documentation = "https://docs.rs/nanofts"
+keywords = ["full-text-search", "search-engine", "lsm-tree", "roaring-bitmap", "nlp"]
+categories = ["database", "text-processing", "algorithms"]
+readme = "README.md"
 
 [lib]
 name = "nanofts"
-crate-type = ["cdylib", "rlib"]
+# When python feature is enabled, build cdylib for Python extension
+# Always build rlib for Rust library
+crate-type = ["rlib"]
+
+[[example]]
+name = "basic_usage"
+required-features = []
 
 [dependencies]
-# Python绑定
-pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"] }
-
 # 高性能Roaring Bitmap
 roaring = "0.10"
 
@@ -63,9 +72,6 @@ mimalloc = { version = "0.1", default-features = false }
 thiserror = "2.0"
 anyhow = "1.0"
 
-# Numpy支持
-numpy = "0.22"
-
 # 日志
 log = "0.4"
 env_logger = "0.11"
@@ -73,8 +79,14 @@ env_logger = "0.11"
 # 时间
 instant = "0.1"
 
+# Python绑定 (可选)
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"], optional = true }
+numpy = { version = "0.22", optional = true }
+
 [features]
 default = ["mimalloc"]
+# Python bindings feature - enables PyO3 and numpy support
+python = ["pyo3", "numpy"]
 simd = ["packed_simd_2"]
 mimalloc = ["mimalloc/local_dynamic_tls"]
 
