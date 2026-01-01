@@ -579,6 +579,94 @@ impl UnifiedEngine {
         Ok(count)
     }
     
+    /// Batch add documents with columnar data - optimized for Arrow/DataFrame-like input
+    /// 
+    /// This method accepts columnar data format which is more efficient when data comes from
+    /// Arrow, pandas DataFrame, or other columnar sources. It avoids the overhead of 
+    /// constructing HashMap for each document.
+    ///
+    /// # Arguments
+    /// * `doc_ids` - Vector of document IDs
+    /// * `columns` - Vector of (field_name, field_values) pairs, where field_values is a Vec<String>
+    ///               with the same length as doc_ids
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// // From pandas: df['id'].tolist(), [('title', df['title'].tolist()), ('content', df['content'].tolist())]
+    /// engine.add_documents_columnar(
+    ///     vec![1, 2, 3],
+    ///     vec![
+    ///         ("title".to_string(), vec!["Doc1".to_string(), "Doc2".to_string(), "Doc3".to_string()]),
+    ///         ("content".to_string(), vec!["Content1".to_string(), "Content2".to_string(), "Content3".to_string()]),
+    ///     ]
+    /// )?;
+    /// ```
+    pub fn add_documents_columnar(
+        &self, 
+        doc_ids: Vec<u32>, 
+        columns: Vec<(String, Vec<String>)>
+    ) -> EngineResult<usize> {
+        let num_docs = doc_ids.len();
+        if num_docs == 0 {
+            return Ok(0);
+        }
+        
+        // Validate column lengths
+        for (field_name, values) in &columns {
+            if values.len() != num_docs {
+                return Err(EngineError::InvalidArgument(format!(
+                    "Column '{}' has {} values, expected {} (same as doc_ids)",
+                    field_name, values.len(), num_docs
+                )));
+            }
+        }
+        
+        // Clear deleted/updated markers for all docs
+        for doc_id in &doc_ids {
+            self.deleted_docs.remove(doc_id);
+            self.updated_docs.remove(doc_id);
+        }
+        
+        // Use optimized columnar batch processing
+        self.add_documents_columnar_parallel(&doc_ids, &columns);
+        
+        self.result_cache.clear();
+        Ok(num_docs)
+    }
+    
+    /// Batch add documents with single text column - simplest columnar format
+    /// 
+    /// This is the fastest path when you have pre-concatenated text for each document.
+    ///
+    /// # Arguments
+    /// * `doc_ids` - Vector of document IDs
+    /// * `texts` - Vector of text content, same length as doc_ids
+    pub fn add_documents_texts(&self, doc_ids: Vec<u32>, texts: Vec<String>) -> EngineResult<usize> {
+        let num_docs = doc_ids.len();
+        if num_docs == 0 {
+            return Ok(0);
+        }
+        
+        if texts.len() != num_docs {
+            return Err(EngineError::InvalidArgument(format!(
+                "texts has {} values, expected {} (same as doc_ids)",
+                texts.len(), num_docs
+            )));
+        }
+        
+        // Clear deleted/updated markers for all docs
+        for doc_id in &doc_ids {
+            self.deleted_docs.remove(doc_id);
+            self.updated_docs.remove(doc_id);
+        }
+        
+        // Use optimized single-column batch processing
+        self.add_documents_texts_parallel(&doc_ids, &texts);
+        
+        self.result_cache.clear();
+        Ok(num_docs)
+    }
+    
     /// Update document
     pub fn update_document(&self, doc_id: u32, fields: HashMap<String, String>) -> EngineResult<()> {
         // 1. Mark document as "updated" (ignore old data in index during search)
@@ -1154,6 +1242,60 @@ impl UnifiedEngine {
         self.add_documents(docs).map_err(Into::into)
     }
     
+    /// Add documents using columnar data format - optimized for Arrow/DataFrame input
+    /// 
+    /// This method is more efficient when data comes from pandas DataFrame or PyArrow.
+    /// It avoids the overhead of constructing Python dicts for each document.
+    ///
+    /// # Arguments
+    /// * `doc_ids` - List of document IDs (can be numpy array or Python list)
+    /// * `columns` - List of (field_name, field_values) tuples, where field_values 
+    ///               is a list of strings with the same length as doc_ids
+    ///
+    /// # Example
+    /// ```python
+    /// import pandas as pd
+    /// df = pd.DataFrame({'id': [1, 2, 3], 'title': ['A', 'B', 'C'], 'content': ['X', 'Y', 'Z']})
+    /// 
+    /// # Columnar format - faster for large datasets
+    /// engine.add_documents_columnar(
+    ///     df['id'].tolist(),
+    ///     [('title', df['title'].tolist()), ('content', df['content'].tolist())]
+    /// )
+    /// ```
+    #[pyo3(name = "add_documents_columnar")]
+    fn add_documents_columnar_py(
+        &self, 
+        doc_ids: Vec<u32>, 
+        columns: Vec<(String, Vec<String>)>
+    ) -> pyo3::PyResult<usize> {
+        self.add_documents_columnar(doc_ids, columns).map_err(Into::into)
+    }
+    
+    /// Add documents using single text column - fastest path for pre-concatenated text
+    ///
+    /// Use this when you have already concatenated all fields into a single text string.
+    ///
+    /// # Arguments
+    /// * `doc_ids` - List of document IDs
+    /// * `texts` - List of text content, same length as doc_ids
+    ///
+    /// # Example
+    /// ```python
+    /// # If you have pre-concatenated text
+    /// doc_ids = [1, 2, 3]
+    /// texts = ["Title1 Content1", "Title2 Content2", "Title3 Content3"]
+    /// engine.add_documents_texts(doc_ids, texts)
+    /// 
+    /// # Or from DataFrame with combined column
+    /// df['combined'] = df['title'] + ' ' + df['content']
+    /// engine.add_documents_texts(df['id'].tolist(), df['combined'].tolist())
+    /// ```
+    #[pyo3(name = "add_documents_texts")]
+    fn add_documents_texts_py(&self, doc_ids: Vec<u32>, texts: Vec<String>) -> pyo3::PyResult<usize> {
+        self.add_documents_texts(doc_ids, texts).map_err(Into::into)
+    }
+    
     #[pyo3(name = "update_document")]
     fn update_document_py(&self, doc_id: u32, fields: HashMap<String, String>) -> pyo3::PyResult<()> {
         self.update_document(doc_id, fields).map_err(Into::into)
@@ -1424,6 +1566,180 @@ impl UnifiedEngine {
             }
             
             // Wait for all threads to complete
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+    }
+    
+    /// Optimized columnar batch processing - for multi-column Arrow/DataFrame data
+    /// Avoids HashMap construction overhead by processing columns directly
+    fn add_documents_columnar_parallel(&self, doc_ids: &[u32], columns: &[(String, Vec<String>)]) {
+        let num_docs = doc_ids.len();
+        if num_docs == 0 {
+            return;
+        }
+        
+        let num_threads = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4)
+            .max(1);
+        
+        let pattern = &self.chinese_pattern;
+        let max_chinese_len = self.max_chinese_length;
+        let min_term_len = self.min_term_length;
+        let track_terms = self.track_doc_terms;
+        
+        let chunk_size = (num_docs + num_threads - 1) / num_threads;
+        
+        let buffer_ref = &self.buffer;
+        let doc_terms_ref = &self.doc_terms;
+        
+        std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(num_threads);
+            
+            for thread_idx in 0..num_threads {
+                let start = thread_idx * chunk_size;
+                if start >= num_docs {
+                    break;
+                }
+                let end = (start + chunk_size).min(num_docs);
+                
+                let handle = s.spawn(move || {
+                    let mut text_buffer = String::with_capacity(512);
+                    let mut local_terms: FxHashMap<String, Vec<u32>> = FxHashMap::default();
+                    let batch_threshold = 2000;
+                    let mut docs_since_flush = 0;
+                    
+                    for idx in start..end {
+                        let doc_id = doc_ids[idx];
+                        
+                        // Concatenate all columns for this document
+                        text_buffer.clear();
+                        for (col_idx, (_, values)) in columns.iter().enumerate() {
+                            if col_idx > 0 {
+                                text_buffer.push(' ');
+                            }
+                            text_buffer.push_str(&values[idx]);
+                        }
+                        
+                        let terms = Self::tokenize_fast(&text_buffer, pattern, max_chinese_len, min_term_len);
+                        
+                        if track_terms {
+                            doc_terms_ref.insert(doc_id, terms.clone());
+                        }
+                        
+                        for term in terms {
+                            local_terms.entry(term)
+                                .or_insert_with(Vec::new)
+                                .push(doc_id);
+                        }
+                        
+                        docs_since_flush += 1;
+                        
+                        if docs_since_flush >= batch_threshold {
+                            for (term, ids) in local_terms.drain() {
+                                buffer_ref.entry(term)
+                                    .or_insert_with(FastBitmap::new)
+                                    .add_many(&ids);
+                            }
+                            docs_since_flush = 0;
+                        }
+                    }
+                    
+                    // Final flush
+                    for (term, ids) in local_terms {
+                        buffer_ref.entry(term)
+                            .or_insert_with(FastBitmap::new)
+                            .add_many(&ids);
+                    }
+                });
+                
+                handles.push(handle);
+            }
+            
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+    }
+    
+    /// Optimized single-text-column batch processing - fastest path for pre-concatenated text
+    fn add_documents_texts_parallel(&self, doc_ids: &[u32], texts: &[String]) {
+        let num_docs = doc_ids.len();
+        if num_docs == 0 {
+            return;
+        }
+        
+        let num_threads = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4)
+            .max(1);
+        
+        let pattern = &self.chinese_pattern;
+        let max_chinese_len = self.max_chinese_length;
+        let min_term_len = self.min_term_length;
+        let track_terms = self.track_doc_terms;
+        
+        let chunk_size = (num_docs + num_threads - 1) / num_threads;
+        
+        let buffer_ref = &self.buffer;
+        let doc_terms_ref = &self.doc_terms;
+        
+        std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(num_threads);
+            
+            for thread_idx in 0..num_threads {
+                let start = thread_idx * chunk_size;
+                if start >= num_docs {
+                    break;
+                }
+                let end = (start + chunk_size).min(num_docs);
+                
+                let handle = s.spawn(move || {
+                    let mut local_terms: FxHashMap<String, Vec<u32>> = FxHashMap::default();
+                    let batch_threshold = 2000;
+                    let mut docs_since_flush = 0;
+                    
+                    for idx in start..end {
+                        let doc_id = doc_ids[idx];
+                        let text = &texts[idx];
+                        
+                        let terms = Self::tokenize_fast(text, pattern, max_chinese_len, min_term_len);
+                        
+                        if track_terms {
+                            doc_terms_ref.insert(doc_id, terms.clone());
+                        }
+                        
+                        for term in terms {
+                            local_terms.entry(term)
+                                .or_insert_with(Vec::new)
+                                .push(doc_id);
+                        }
+                        
+                        docs_since_flush += 1;
+                        
+                        if docs_since_flush >= batch_threshold {
+                            for (term, ids) in local_terms.drain() {
+                                buffer_ref.entry(term)
+                                    .or_insert_with(FastBitmap::new)
+                                    .add_many(&ids);
+                            }
+                            docs_since_flush = 0;
+                        }
+                    }
+                    
+                    // Final flush
+                    for (term, ids) in local_terms {
+                        buffer_ref.entry(term)
+                            .or_insert_with(FastBitmap::new)
+                            .add_many(&ids);
+                    }
+                });
+                
+                handles.push(handle);
+            }
+            
             for handle in handles {
                 handle.join().unwrap();
             }
