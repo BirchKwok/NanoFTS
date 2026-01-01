@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "nanofts"
-version = "0.3.1"
+version = "0.3.2"
 description = "High-performance full-text search engine written in Rust"
 readme = "README.md"
 license = {text = "Apache-2.0"}
