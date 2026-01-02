@@ -1,6 +1,6 @@
 [package]
 name = "nanofts"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 authors = ["Birch Kwok"]
 description = "High-performance full-text search engine in Rust"

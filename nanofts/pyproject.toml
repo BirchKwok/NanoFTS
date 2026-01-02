@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "nanofts"
-version = "0.3.2"
+version = "0.3.3"
 description = "High-performance full-text search engine written in Rust"
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -22,7 +22,7 @@ classifiers = [
 ]
 
 [tool.maturin]
-features = ["pyo3/extension-module"]
+features = ["python", "pyo3/extension-module"]
 module-name = "nanofts.nanofts"
 python-source = "python"
 

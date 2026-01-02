@@ -192,7 +192,7 @@ impl std::fmt::Display for ResultHandle {
 #[cfg(feature = "python")]
 #[pyo3::pymethods]
 impl ResultHandle {
-    #[getter]
+    #[getter(total_hits)]
     fn total_hits_py(&self) -> u64 {
         self.total_hits()
     }
