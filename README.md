@@ -63,7 +63,7 @@ Add this to your project `Cargo.toml`:
 
 ```toml
 [dependencies]
-nanofts = "0.3"
+nanofts = "0.4.0"
 ```
 
 Optional features:
@@ -136,7 +136,71 @@ cargo run --example basic_usage --release
 - **Prefer batch ingestion**: it reduces per-document overhead and lets the engine use its optimized parallel paths.
 - **Fastest Rust API**: `UnifiedEngine::add_documents_texts(doc_ids, texts)` is the fastest ingestion path when you can pre-concatenate all searchable fields into a single `String` per document.
 - **Columnar ingestion**: `UnifiedEngine::add_documents_columnar(doc_ids, columns)` avoids constructing a `HashMap` per document and is a good fit for Arrow/DataFrame-style input.
+- **Arrow zero-copy ingestion**: if your data is already in Arrow (or can be represented as borrowed `&str` slices), use `UnifiedEngine::add_documents_arrow_str(doc_ids, columns)` (multi-column) or `UnifiedEngine::add_documents_arrow_texts(doc_ids, texts)` (single merged text column) to avoid `String` allocation/copy.
 - **Batch HashMap ingestion**: `UnifiedEngine::add_documents(docs)` is still much faster than calling `add_document` in a loop.
+
+### Arrow Zero-Copy API Examples
+
+#### Multi-column zero-copy ingestion
+
+```rust
+use nanofts::{UnifiedEngine, EngineConfig};
+
+let engine = UnifiedEngine::new(EngineConfig::memory_only())?;
+
+// Simulate Arrow StringArray data (in real use, extract from Arrow)
+let doc_ids = vec![1, 2, 3];
+let titles = vec!["Title 1", "Title 2", "Title 3"];
+let contents = vec!["Content 1", "Content 2", "Content 3"];
+
+// Zero-copy columnar ingestion
+let columns = vec![
+    ("title".to_string(), titles),
+    ("content".to_string(), contents),
+];
+
+engine.add_documents_arrow_str(&doc_ids, columns)?;
+```
+
+#### Single-column zero-copy ingestion (fastest for Arrow)
+
+```rust
+// Pre-merged text from Arrow (single column)
+let doc_ids = vec![1, 2, 3];
+let merged_texts = vec![
+    "Title 1 Content 1",
+    "Title 2 Content 2", 
+    "Title 3 Content 3",
+];
+
+// Zero-copy single column ingestion
+engine.add_documents_arrow_texts(&doc_ids, &merged_texts)?;
+```
+
+#### Real Arrow StringArray integration
+
+```rust
+// Example with real Arrow StringArray
+use arrow_array::StringArray;
+
+let title_array = StringArray::from(vec!["Title 1", "Title 2", "Title 3"]);
+let content_array = StringArray::from(vec!["Content 1", "Content 2", "Content 3"]);
+
+// Extract zero-copy string slices from Arrow
+let title_slices: Vec<&str> = title_array.iter()
+    .map(|s| s.unwrap_or(""))
+    .collect();
+let content_slices: Vec<&str> = content_array.iter()
+    .map(|s| s.unwrap_or(""))
+    .collect();
+
+let columns = vec![
+    ("title".to_string(), title_slices),
+    ("content".to_string(), content_slices),
+];
+
+engine.add_documents_arrow_str(&doc_ids, columns)?;
+```
 
 ### Flush/compact strategy
 

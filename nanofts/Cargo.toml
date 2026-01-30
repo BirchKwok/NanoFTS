@@ -1,6 +1,6 @@
 [package]
 name = "nanofts"
-version = "0.3.3"
+version = "0.4.0"
 edition = "2021"
 authors = ["Birch Kwok"]
 description = "High-performance full-text search engine in Rust"
@@ -21,6 +21,14 @@ crate-type = ["rlib"]
 
 [[example]]
 name = "basic_usage"
+required-features = []
+
+[[example]]
+name = "ingestion_baseline"
+required-features = []
+
+[[example]]
+name = "ingestion_compare"
 required-features = []
 
 [dependencies]
@@ -79,6 +87,11 @@ env_logger = "0.11"
 # 时间
 instant = "0.1"
 
+# Arrow support (可选)
+arrow = { version = "53", optional = true, default-features = false, features = ["ffi"] }
+arrow-array = { version = "53", optional = true }
+arrow-buffer = { version = "53", optional = true }
+
 # Python绑定 (可选)
 pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"], optional = true }
 numpy = { version = "0.22", optional = true }
@@ -92,6 +105,7 @@ default = ["mimalloc"]
 python = ["pyo3", "numpy"]
 simd = ["packed_simd_2"]
 mimalloc = ["mimalloc/local_dynamic_tls"]
+arrow = ["dep:arrow", "dep:arrow-array", "dep:arrow-buffer"]  # Arrow zero-copy support
 
 [profile.release]
 opt-level = 3

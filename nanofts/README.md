@@ -53,6 +53,178 @@ engine.remove_document(2)
 engine.compact()
 ```
 
+## Rust Usage (Rust Core)
+
+The Rust crate name is `nanofts` (minimum Rust version: `rustc >= 1.75`). If you are building a Rust service, you can use it directly as a pure Rust full-text search library.
+
+### Add as a dependency
+
+Add this to your project `Cargo.toml`:
+
+```toml
+[dependencies]
+nanofts = "0.4.0"
+```
+
+Optional features:
+
+- **`mimalloc`**: enabled by default; lower latency / more stable allocation performance
+- **`python`**: enable PyO3/Numpy bindings (only needed if you build the Python extension)
+- **`simd`**: enable SIMD acceleration (requires nightly and `packed_simd_2`)
+
+### Minimal example: in-memory indexing and searching
+
+```rust
+use nanofts::{UnifiedEngine, EngineConfig, EngineResult};
+use std::collections::HashMap;
+
+fn main() -> EngineResult<()> {
+    // 1) Create an in-memory engine
+    let engine = UnifiedEngine::new(EngineConfig::memory_only())?;
+
+    // 2) Add a document (field values must be String)
+    let mut fields = HashMap::new();
+    fields.insert("title".to_string(), "Rust Tutorial".to_string());
+    fields.insert("content".to_string(), "Build a high-performance full-text search engine in Rust".to_string());
+    engine.add_document(1, fields)?;
+
+    // 3) Search
+    let result = engine.search("Rust")?;
+    println!("hits={}, ids={:?}", result.total_hits(), result.to_list());
+    Ok(())
+}
+```
+
+### Persistence: single-file index + WAL recovery
+
+```rust
+use nanofts::{UnifiedEngine, EngineConfig, EngineResult};
+
+fn main() -> EngineResult<()> {
+    let config = EngineConfig::persistent("./index.nfts")
+        .with_lazy_load(true)
+        .with_cache_size(10_000);
+    let engine = UnifiedEngine::new(config)?;
+
+    // ... add/update/remove ...
+
+    // Flush new documents to disk
+    engine.flush()?;
+
+    // Deletions become permanent only after compaction
+    engine.compact()?;
+    Ok(())
+}
+```
+
+### Run the built-in Rust example in this repo
+
+```bash
+cargo run --example basic_usage --release
+```
+
+## Performance Tuning (Rust Developer Perspective)
+
+### Build and runtime knobs
+
+- **Use release builds**: `cargo build --release` / `cargo run --release` (this repo already configures `lto=fat`, `codegen-units=1`, `panic=abort`, `strip=true` for release).
+- **Optimize for your CPU** (optional): set `RUSTFLAGS="-C target-cpu=native"` when building/running on a specific machine.
+- **SIMD** (optional): if you enable `--features simd`, use nightly and validate the benefit for your workload.
+
+### Fastest ingestion formats and APIs
+
+- **Prefer batch ingestion**: it reduces per-document overhead and lets the engine use its optimized parallel paths.
+- **Fastest Rust API**: `UnifiedEngine::add_documents_texts(doc_ids, texts)` is the fastest ingestion path when you can pre-concatenate all searchable fields into a single `String` per document.
+- **Columnar ingestion**: `UnifiedEngine::add_documents_columnar(doc_ids, columns)` avoids constructing a `HashMap` per document and is a good fit for Arrow/DataFrame-style input.
+- **Arrow zero-copy ingestion**: if your data is already in Arrow (or can be represented as borrowed `&str` slices), use `UnifiedEngine::add_documents_arrow_str(doc_ids, columns)` (multi-column) or `UnifiedEngine::add_documents_arrow_texts(doc_ids, texts)` (single merged text column) to avoid `String` allocation/copy.
+- **Batch HashMap ingestion**: `UnifiedEngine::add_documents(docs)` is still much faster than calling `add_document` in a loop.
+
+### Arrow Zero-Copy API Examples
+
+#### Multi-column zero-copy ingestion
+
+```rust
+use nanofts::{UnifiedEngine, EngineConfig};
+
+let engine = UnifiedEngine::new(EngineConfig::memory_only())?;
+
+// Simulate Arrow StringArray data (in real use, extract from Arrow)
+let doc_ids = vec![1, 2, 3];
+let titles = vec!["Title 1", "Title 2", "Title 3"];
+let contents = vec!["Content 1", "Content 2", "Content 3"];
+
+// Zero-copy columnar ingestion
+let columns = vec![
+    ("title".to_string(), titles),
+    ("content".to_string(), contents),
+];
+
+engine.add_documents_arrow_str(&doc_ids, columns)?;
+```
+
+#### Single-column zero-copy ingestion (fastest for Arrow)
+
+```rust
+// Pre-merged text from Arrow (single column)
+let doc_ids = vec![1, 2, 3];
+let merged_texts = vec![
+    "Title 1 Content 1",
+    "Title 2 Content 2", 
+    "Title 3 Content 3",
+];
+
+// Zero-copy single column ingestion
+engine.add_documents_arrow_texts(&doc_ids, &merged_texts)?;
+```
+
+#### Real Arrow StringArray integration
+
+```rust
+// Example with real Arrow StringArray
+use arrow_array::StringArray;
+
+let title_array = StringArray::from(vec!["Title 1", "Title 2", "Title 3"]);
+let content_array = StringArray::from(vec!["Content 1", "Content 2", "Content 3"]);
+
+// Extract zero-copy string slices from Arrow
+let title_slices: Vec<&str> = title_array.iter()
+    .map(|s| s.unwrap_or(""))
+    .collect();
+let content_slices: Vec<&str> = content_array.iter()
+    .map(|s| s.unwrap_or(""))
+    .collect();
+
+let columns = vec![
+    ("title".to_string(), title_slices),
+    ("content".to_string(), content_slices),
+];
+
+engine.add_documents_arrow_str(&doc_ids, columns)?;
+```
+
+### Flush/compact strategy
+
+- **`flush()` frequency**: flushing periodically bounds WAL/memory usage, but flushing too often may increase IO amplification.
+- **Deletion persistence**: deletes/updates are logical until `compact()`.
+  - If you delete a lot, compact in bigger batches rather than after every small delete wave.
+- **Track doc terms only when you need updates/deletes**: enable it only if you need update/delete support (Python: `track_doc_terms=True`). It adds extra bookkeeping on ingestion.
+
+### Large indexes and memory footprint
+
+- **Use `lazy_load`** when the index is large and you don't want to map everything into memory: `with_lazy_load(true)` / Python `lazy_load=True`.
+- **Tune `cache_size`**: in `lazy_load` mode, cache hit rate is a major driver for latency. Iterate using `engine.stats()` (e.g., cache hit rate).
+
+### Query-side optimization
+
+- **Use boolean/batch APIs and set operations**: prefer `search_and` / `search_or` or `ResultHandle::{intersect, union, difference}` to avoid repeated work.
+- **Fuzzy search is more expensive**: `fuzzy_search` introduces extra candidate generation and edit-distance checks. Use it only when needed and tune thresholds/distances.
+
+### Benchmarking and profiling
+
+- **Benchmarks**: use `cargo bench` (or your own fixed dataset) and compare A/B with realistic data scale, term distribution, and query sets.
+- **CPU profiling**: profile release binaries to find hot spots (tokenization, bitmap ops, IO, compression/decompression). On macOS, Instruments is usually the easiest.
+- **Measure first**: use `engine.stats()` to track search counts, cumulative time, and cache hit rate before tuning.
+
 ## API Reference
 
 ### Creating Engine
