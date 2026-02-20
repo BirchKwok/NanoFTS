@@ -24,6 +24,7 @@ NanoFTS is a full-text search engine optimized for billion-scale data, with a Ru
 | [Quick Start](./tutorial.md#quick-start) | Get started with NanoFTS in 5 minutes |
 | [Complete Tutorial](./tutorial.md) | Detailed feature guide |
 | [API Reference](./api-reference.md) | Complete API documentation (100% coverage) |
+| [Rust 写入性能指南](./rust-ingestion-performance.md) | Rust API 架构变更说明与最优性能使用方法 |
 
 ## Installation
 

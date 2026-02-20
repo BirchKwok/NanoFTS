@@ -34,8 +34,8 @@ engine = create_engine(
 )
 
 # Add documents (field values must be strings)
-engine.add_document(1, {"title": "Python教程", "content": "学习Python编程"})
-engine.add_document(2, {"title": "数据分析", "content": "使用pandas进行数据处理"})
+engine.add_document(1, {"title": "Python Tutorial", "content": "Learn Python programming"})
+engine.add_document(2, {"title": "Data Analysis", "content": "Process data with pandas"})
 engine.flush()
 
 # Search - returns ResultHandle object
@@ -44,7 +44,7 @@ print(f"Found {result.total_hits} documents")
 print(f"Document IDs: {result.to_list()}")
 
 # Update document
-engine.update_document(1, {"title": "高级Python教程", "content": "深入学习Python"})
+engine.update_document(1, {"title": "Advanced Python Tutorial", "content": "Deep dive into Python"})
 
 # Delete document
 engine.remove_document(2)
@@ -63,7 +63,7 @@ Add this to your project `Cargo.toml`:
 
 ```toml
 [dependencies]
-nanofts = "0.4.0"
+nanofts = "0.5.0"
 ```
 
 Optional features:
