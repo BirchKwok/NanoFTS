@@ -472,6 +472,8 @@ pub struct UnifiedEngine {
     chinese_pattern: regex::Regex,
     // Compact lock: compact gets write lock, flush gets read lock
     compact_lock: RwLock<()>,
+    // Background flush handle (for flush_async)
+    flush_handle: Mutex<Option<std::thread::JoinHandle<Result<usize, String>>>>,
 }
 
 // Pure Rust API implementation
@@ -549,6 +551,7 @@ impl UnifiedEngine {
             preloaded: std::sync::atomic::AtomicBool::new(false),
             chinese_pattern: regex::Regex::new(r"[\u4e00-\u9fff]+").unwrap(),
             compact_lock: RwLock::new(()),
+            flush_handle: Mutex::new(None),
         })
     }
     
@@ -1066,19 +1069,14 @@ impl UnifiedEngine {
         let _lock = self.compact_lock.read();
         
         if let Some(ref index) = self.index {
-            // Collect all doc_ids and data from buffer
-            let mut flushed_doc_ids = std::collections::HashSet::new();
             let mut entries: Vec<(String, FastBitmap)> = Vec::new();
             
-            // Remove all entries from buffer (atomic operation)
-            let id_to_str_map = self.build_id_to_str_map();
+            // Drain buffer; look up term strings directly from id_to_str (avoids
+            // the O(dict) build_id_to_str_map copy).
             let keys: Vec<u32> = self.buffer.iter().map(|e| *e.key()).collect();
             for key in keys {
                 if let Some((term_id, bitmap)) = self.buffer.remove(&key) {
-                    if let Some(term_str) = id_to_str_map.get(&term_id).cloned() {
-                        for doc_id in bitmap.iter() {
-                            flushed_doc_ids.insert(doc_id);
-                        }
+                    if let Some(term_str) = self.id_to_str.get(&term_id).map(|r| r.value().clone()) {
                         entries.push((term_str, bitmap));
                     }
                 }
@@ -1087,13 +1085,15 @@ impl UnifiedEngine {
             let count = entries.len();
             
             if !entries.is_empty() {
+                // Clean updated_docs for all flushed documents.
+                for (_, bitmap) in &entries {
+                    for doc_id in bitmap.iter() {
+                        self.updated_docs.remove(&doc_id);
+                    }
+                }
                 index.upsert_batch(entries);
                 index.flush()
                     .map_err(|e| EngineError::IndexError(e.to_string()))?;
-                
-                for doc_id in flushed_doc_ids {
-                    self.updated_docs.remove(&doc_id);
-                }
             }
             
             Ok(count)
@@ -1102,6 +1102,92 @@ impl UnifiedEngine {
         }
     }
     
+    /// Flush to disk asynchronously — returns immediately, disk I/O runs in a background thread.
+    ///
+    /// Data is still searchable after this call returns (it remains in `LsmSingleIndex`'s
+    /// in-memory buffer until the background thread persists it). Call [`wait_flush`] to
+    /// block until the background write completes.
+    ///
+    /// **Use case**: bulk index builds where you want to start searching immediately without
+    /// waiting for fsync. Not intended as a replacement for [`flush`] in write-heavy
+    /// incremental workloads.
+    pub fn flush_async(&self) -> EngineResult<()> {
+        if self.memory_only {
+            return Ok(());
+        }
+
+        let _lock = self.compact_lock.read();
+
+        if let Some(ref index) = self.index {
+            // --- Sync part (fast): drain UnifiedEngine buffer ---
+            // Look up term strings directly in id_to_str (no full-dict copy).
+            let keys: Vec<u32> = self.buffer.iter().map(|e| *e.key()).collect();
+            let mut entries: Vec<(String, FastBitmap)> = Vec::new();
+
+            for key in keys {
+                if let Some((term_id, bitmap)) = self.buffer.remove(&key) {
+                    if let Some(term_str) = self.id_to_str.get(&term_id).map(|r| r.value().clone()) {
+                        entries.push((term_str, bitmap));
+                    }
+                }
+            }
+
+            self.result_cache.clear();
+
+            // Pre-clean updated_docs for all flushed documents.
+            for (_, bitmap) in &entries {
+                for doc_id in bitmap.iter() {
+                    self.updated_docs.remove(&doc_id);
+                }
+            }
+
+            let count = entries.len();
+
+            if !entries.is_empty() {
+                // --- Fast sync part: make data searchable immediately, zero disk I/O ---
+                // merge_into_data writes directly to LsmSingleIndex.data (full-load mode),
+                // bypassing WAL and the buffer-threshold auto-flush so this returns in
+                // microseconds regardless of how many entries there are.
+                index.merge_into_data(&entries);
+
+                // --- Async part: all disk I/O (WAL-less buffer write + fsync) in background ---
+                let index_clone = Arc::clone(index);
+                let handle = std::thread::spawn(move || {
+                    // Put entries into LsmSingleIndex.buffer without WAL and without
+                    // triggering maybe_flush; the explicit flush() below handles persistence.
+                    index_clone.enqueue_for_flush(entries);
+                    index_clone.flush()
+                        .map_err(|e| e.to_string())?;
+                    Ok::<usize, String>(count)
+                });
+
+                *self.flush_handle.lock() = Some(handle);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Wait for a previously started [`flush_async`] to complete.
+    ///
+    /// Returns the number of terms flushed, or an error if the background thread
+    /// failed or panicked. Returns `Ok(0)` if no background flush is pending.
+    pub fn wait_flush(&self) -> EngineResult<usize> {
+        let handle = self.flush_handle.lock().take();
+        match handle {
+            Some(h) => {
+                let result = h
+                    .join()
+                    .map_err(|_| EngineError::IndexError("Background flush thread panicked".to_string()))?
+                    .map_err(|e| EngineError::IndexError(e));
+                // Invalidate any cached results that were computed while disk write was in flight
+                self.result_cache.clear();
+                result
+            }
+            None => Ok(0),
+        }
+    }
+
     /// Save (same as flush)
     pub fn save(&self) -> EngineResult<usize> {
         self.flush()
@@ -1504,6 +1590,16 @@ impl UnifiedEngine {
     fn flush_py(&self) -> pyo3::PyResult<usize> {
         self.flush().map_err(Into::into)
     }
+
+    #[pyo3(name = "flush_async")]
+    fn flush_async_py(&self) -> pyo3::PyResult<()> {
+        self.flush_async().map_err(Into::into)
+    }
+
+    #[pyo3(name = "wait_flush")]
+    fn wait_flush_py(&self) -> pyo3::PyResult<usize> {
+        self.wait_flush().map_err(Into::into)
+    }
     
     #[pyo3(name = "save")]
     fn save_py(&self) -> pyo3::PyResult<usize> {
@@ -1640,7 +1736,7 @@ impl UnifiedEngine {
         let max_chinese_len = self.max_chinese_length;
         let min_term_len = self.min_term_length;
         let chunk_size = (num_docs + num_threads - 1) / num_threads;
-        let d2 = &self.dict; let n2 = &self.next_term_id; let b2 = &self.buffer;
+        let d2 = &self.dict; let i2 = &self.id_to_str; let n2 = &self.next_term_id; let b2 = &self.buffer;
         std::thread::scope(|s| {
             for thread_idx in 0..num_threads {
                 let start = thread_idx * chunk_size;
@@ -1674,7 +1770,8 @@ impl UnifiedEngine {
                             dashmap::mapref::entry::Entry::Occupied(e) => *e.get(),
                             dashmap::mapref::entry::Entry::Vacant(e) => {
                                 let id = n2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                e.insert(id); id
+                                e.insert(id);
+                                i2.insert(id, term.to_string()); id
                             }
                         };
                         l2g[lid as usize] = gid;
@@ -1696,7 +1793,7 @@ impl UnifiedEngine {
         let max_chinese_len = self.max_chinese_length;
         let min_term_len = self.min_term_length;
         let chunk_size = (num_docs + num_threads - 1) / num_threads;
-        let d2 = &self.dict; let n2 = &self.next_term_id; let b2 = &self.buffer;
+        let d2 = &self.dict; let i2 = &self.id_to_str; let n2 = &self.next_term_id; let b2 = &self.buffer;
         std::thread::scope(|s| {
             for thread_idx in 0..num_threads {
                 let start = thread_idx * chunk_size;
@@ -1730,7 +1827,8 @@ impl UnifiedEngine {
                             dashmap::mapref::entry::Entry::Occupied(e) => *e.get(),
                             dashmap::mapref::entry::Entry::Vacant(e) => {
                                 let id = n2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                e.insert(id); id
+                                e.insert(id);
+                                i2.insert(id, term.to_string()); id
                             }
                         };
                         l2g[lid as usize] = gid;
@@ -1752,7 +1850,7 @@ impl UnifiedEngine {
         let max_chinese_len = self.max_chinese_length;
         let min_term_len = self.min_term_length;
         let chunk_size = (num_docs + num_threads - 1) / num_threads;
-        let d2 = &self.dict; let n2 = &self.next_term_id; let b2 = &self.buffer;
+        let d2 = &self.dict; let i2 = &self.id_to_str; let n2 = &self.next_term_id; let b2 = &self.buffer;
         std::thread::scope(|s| {
             for thread_idx in 0..num_threads {
                 let start = thread_idx * chunk_size;
@@ -1780,7 +1878,8 @@ impl UnifiedEngine {
                             dashmap::mapref::entry::Entry::Occupied(e) => *e.get(),
                             dashmap::mapref::entry::Entry::Vacant(e) => {
                                 let id = n2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                e.insert(id); id
+                                e.insert(id);
+                                i2.insert(id, term.to_string()); id
                             }
                         };
                         l2g[lid as usize] = gid;
@@ -1803,7 +1902,7 @@ impl UnifiedEngine {
         let min_term_len = self.min_term_length;
         let chunk_size = (num_docs + num_threads - 1) / num_threads;
         let columns_slices: Vec<Vec<&'a str>> = columns.iter().map(|(_, v)| v.to_vec()).collect();
-        let d2 = &self.dict; let n2 = &self.next_term_id; let b2 = &self.buffer;
+        let d2 = &self.dict; let i2 = &self.id_to_str; let n2 = &self.next_term_id; let b2 = &self.buffer;
         std::thread::scope(|s| {
             for thread_idx in 0..num_threads {
                 let start = thread_idx * chunk_size;
@@ -1839,7 +1938,8 @@ impl UnifiedEngine {
                             dashmap::mapref::entry::Entry::Occupied(e) => *e.get(),
                             dashmap::mapref::entry::Entry::Vacant(e) => {
                                 let id = n2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                e.insert(id); id
+                                e.insert(id);
+                                i2.insert(id, term.to_string()); id
                             }
                         };
                         l2g[lid as usize] = gid;
@@ -1862,7 +1962,7 @@ impl UnifiedEngine {
         let max_chinese_len = self.max_chinese_length;
         let min_term_len = self.min_term_length;
         let chunk_size = (num_docs + num_threads - 1) / num_threads;
-        let d2 = &self.dict; let n2 = &self.next_term_id; let b2 = &self.buffer;
+        let d2 = &self.dict; let i2 = &self.id_to_str; let n2 = &self.next_term_id; let b2 = &self.buffer;
         std::thread::scope(|s| {
             for thread_idx in 0..num_threads {
                 let start = thread_idx * chunk_size;
@@ -1892,7 +1992,8 @@ impl UnifiedEngine {
                             dashmap::mapref::entry::Entry::Occupied(e) => *e.get(),
                             dashmap::mapref::entry::Entry::Vacant(e) => {
                                 let id = n2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                e.insert(id); id
+                                e.insert(id);
+                                i2.insert(id, term.to_string()); id
                             }
                         };
                         l2g[lid as usize] = gid;

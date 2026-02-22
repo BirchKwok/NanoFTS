@@ -358,7 +358,7 @@ Get current fuzzy search configuration.
 def flush(self) -> int
 ```
 
-Flush buffer to disk.
+Flush buffer to disk synchronously. Blocks until all data is written and fsync'd.
 
 **Returns:** Number of terms flushed
 
@@ -366,6 +366,59 @@ Flush buffer to disk.
 ```python
 count = engine.flush()
 print(f"Flushed {count} terms")
+```
+
+#### flush_async
+
+```python
+def flush_async(self) -> None
+```
+
+Start an asynchronous flush. Returns immediately after making data searchable in memory; actual disk write (fsync) runs in a background thread.
+
+**Key properties:**
+- Returns in microseconds to low milliseconds (only CPU work: buffer drain + in-memory merge)
+- Data is **immediately searchable** after this call returns, before `wait_flush()` is called
+- Disk persistence is **not guaranteed** until `wait_flush()` completes
+- No-op in memory-only mode
+
+**Use case:** Bulk index builds where you want to start serving queries immediately without waiting for fsync.
+
+**Example:**
+```python
+engine.add_documents_texts(doc_ids, texts)
+engine.flush_async()         # Returns in ~5-60ms; data already searchable
+
+# Can search immediately — no need to wait
+result = engine.search("keyword")   # ✅ Returns correct hits
+
+# ... do other work while disk I/O runs in background ...
+
+engine.wait_flush()          # Block until data is durably persisted
+```
+
+> **Note:** Do not use `flush_async` as a replacement for `flush` in write-heavy incremental workloads where durability is required after each write.
+
+#### wait_flush
+
+```python
+def wait_flush(self) -> int
+```
+
+Wait for a previously started `flush_async()` to complete.
+
+**Returns:** Number of terms flushed by the background thread, or `0` if no background flush is pending.
+
+**Raises:** `RuntimeError` if the background flush thread panicked.
+
+> **`wait_flush()` is optional.** The background thread holds an internal reference to the index and will run to completion even if this method is never called. Call it only when you need a synchronization point, want to surface errors, or must confirm durability before proceeding.
+
+**Example:**
+```python
+engine.flush_async()
+# ... search / other work ...
+terms = engine.wait_flush()
+print(f"Background flush persisted {terms} terms")
 ```
 
 #### save

@@ -13,6 +13,7 @@ A high-performance full-text search engine with Rust core, featuring efficient i
 - **NumPy Support**: Direct numpy array output
 - **Multilingual**: Support for both English and Chinese text
 - **Persistence**: Disk-based storage with WAL recovery
+- **Async Flush**: Non-blocking `flush_async()` / `wait_flush()` for instant post-index searchability
 - **LRU Cache**: Built-in caching for frequently accessed terms
 - **Data Import**: Import from pandas, polars, arrow, parquet, CSV, JSON
 
@@ -63,7 +64,7 @@ Add this to your project `Cargo.toml`:
 
 ```toml
 [dependencies]
-nanofts = "0.5.0"
+nanofts = "0.6.0"
 ```
 
 Optional features:
@@ -108,8 +109,13 @@ fn main() -> EngineResult<()> {
 
     // ... add/update/remove ...
 
-    // Flush new documents to disk
+    // Option A — synchronous flush (blocks until fsync completes)
     engine.flush()?;
+
+    // Option B — asynchronous flush (returns immediately, data is searchable at once)
+    engine.flush_async()?;
+    let hits = engine.search("keyword")?; // ✅ correct results before wait
+    engine.wait_flush()?;                 // block until durably persisted
 
     // Deletions become permanent only after compaction
     engine.compact()?;
@@ -204,6 +210,8 @@ engine.add_documents_arrow_str(&doc_ids, columns)?;
 
 ### Flush/compact strategy
 
+- **`flush()` vs `flush_async()`**: use `flush()` when you need a durability guarantee before proceeding; use `flush_async()` + `wait_flush()` when you want to start serving queries immediately after bulk ingestion without waiting for fsync.
+- **`flush_async()` timing**: returns after a fast CPU-only phase (buffer drain + in-memory merge). Data is immediately searchable. Call `wait_flush()` at any later point to ensure persistence.
 - **`flush()` frequency**: flushing periodically bounds WAL/memory usage, but flushing too often may increase IO amplification.
 - **Deletion persistence**: deletes/updates are logical until `compact()`.
   - If you delete a lot, compact in bigger batches rather than after every small delete wave.
@@ -267,8 +275,13 @@ engine.remove_document(1)
 # Delete multiple documents
 engine.remove_documents([1, 2, 3])
 
-# Flush buffer to disk
+# Flush buffer to disk (synchronous)
 engine.flush()
+
+# Flush asynchronously — data searchable immediately, disk I/O in background
+engine.flush_async()
+result = engine.search("keyword")  # ✅ Returns correct results right away
+engine.wait_flush()                # Wait for background disk write to complete
 
 # Compact index (applies deletions permanently)
 engine.compact()
@@ -484,7 +497,7 @@ result = engine.search("temporary")
 
 1. **Always call `compact()` after bulk deletions** - Deletions are only persisted after compaction
 2. **Use `track_doc_terms=True`** if you need update/delete operations
-3. **Call `flush()` periodically** to persist new documents
+3. **Call `flush()` periodically** to persist new documents; use `flush_async()` + `wait_flush()` when you want zero query-blocking during bulk index builds
 4. **Use `lazy_load=True`** for large indexes that don't fit in memory
 
 ### Performance Tips

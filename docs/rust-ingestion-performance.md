@@ -1,6 +1,6 @@
 # NanoFTS Rust 写入性能指南
 
-本文档说明 NanoFTS v0.5.0 引擎在写入链路上引入的架构变更，以及如何正确使用 Rust API 以达到最优吞吐量。
+本文档说明 NanoFTS v0.6.0 引擎在写入链路上引入的架构变更，以及如何正确使用 Rust API 以达到最优吞吐量。
 
 ## 目录
 
@@ -16,7 +16,7 @@
 
 ## 架构变更概述
 
-v0.5.0 对批量写入路径进行了五项主要优化，整体吞吐量在真实场景下提升约 **3×**，峰值达到 **943 万文档/秒**：
+v0.6.0 对批量写入路径进行了五项主要优化，整体吞吐量在真实场景下提升约 **3×**，峰值达到 **943 万文档/秒**：
 
 | 优化项 | 变更前 | 变更后 | 收益 |
 |--------|--------|--------|------|
@@ -492,10 +492,115 @@ engine.add_documents_arrow_texts(&doc_ids, &text_refs)?;
 
 ---
 
+## 异步 Flush：`flush_async()` + `wait_flush()`
+
+### 为什么需要异步 Flush
+
+`flush()` 在完成 `sync_all()` 之前会阻塞调用线程。对于 100k 文档的批量建索引场景，阻塞时间约 **450ms**（SSD）。在此期间，任何搜索请求都只能等待。
+
+`flush_async()` 将磁盘 I/O 全部卸载到后台线程，主线程仅执行 CPU 密集型操作（buffer drain + 内存合并），完成后**立即可搜索**。
+
+### 工作原理
+
+```
+flush_async() 调用流程
+│
+├─ [主线程，同步] 从 UnifiedEngine.buffer 取出所有 entries
+├─ [主线程，同步] 直接合并进 LsmSingleIndex.data（DashMap，并行写入）
+│   └─ 此时数据已可被搜索
+├─ [后台线程，异步] enqueue_for_flush → flush()
+│   ├─ WAL 写入（可选）
+│   ├─ 序列化 + zstd 压缩
+│   └─ sync_all()（真正的 fsync）
+│
+└─ wait_flush() 等待后台线程结束
+```
+
+### Rust API
+
+```rust
+use nanofts::{UnifiedEngine, EngineConfig};
+
+let engine = UnifiedEngine::new(EngineConfig::persistent("./index.nfts"))?;
+
+// 批量导入
+engine.add_documents_texts(doc_ids, texts)?;
+
+// 异步 flush —— 微秒到毫秒级返回
+engine.flush_async()?;
+
+// 立即可搜索，无需等待磁盘写入
+let result = engine.search("keyword")?;
+assert!(result.total_hits() > 0);
+
+// 在合适时机等待持久化完成
+let terms = engine.wait_flush()?;
+println!("持久化了 {terms} 个词项");
+```
+
+### Python API
+
+```python
+import nanofts
+
+engine = nanofts.create_engine("./index.nfts")
+
+doc_ids = list(range(1, 100001))
+texts   = [f"document {i} with keywords alpha beta gamma" for i in doc_ids]
+
+engine.add_documents_texts(doc_ids, texts)
+
+# 异步 flush
+engine.flush_async()
+
+# 立即搜索
+result = engine.search("alpha")
+print(f"即时命中：{result.total_hits}")  # 100000
+
+# 等待持久化
+terms = engine.wait_flush()
+print(f"已持久化 {terms} 个词项")
+```
+
+### 基准测试数据（SSD，release 编译）
+
+| 规模 | `flush()` 阻塞时间 | `flush_async()` 返回时间 | 主线程节省 | 即时命中 |
+|------|------------------|-----------------------|---------|---------|
+| 10,000 | 91ms | **5.8ms** | 85ms | ✅ 全部 |
+| 50,000 | 228ms | **29.7ms** | 198ms | ✅ 全部 |
+| 100,000 | 452ms | **58ms** | 394ms | ✅ 全部 |
+
+`wait_flush()` 的实际等待时间约为同步 `flush()` 的一半（后台线程与主线程并行执行）。
+
+运行基准测试：
+
+```bash
+cargo run --example flush_benchmark --release
+```
+
+### 何时选择哪种方式
+
+| 场景 | 推荐 |
+|------|------|
+| 批量建索引后立即提供查询服务 | `flush_async()` + `wait_flush()` |
+| 每次写入都必须立即持久化 | `flush()` |
+| 内存模式（无磁盘） | 两者均可（均为 no-op） |
+| 写入量大、需限制 fsync 频率 | 写入多批后调用一次 `flush_async()` |
+
+### 注意事项
+
+- **`wait_flush()` 是可选的。** 背景线程持有 `Arc<LsmSingleIndex>` 的克隆，即使 JoinHandle 被丢弃（或 `UnifiedEngine` 被 drop），线程也会继续运行直到完成，数据最终会写入磁盘。
+- **进程强制退出（crash / kill -9）除外。** 若进程在背景线程完成 `sync_all()` 之前退出，数据可能未持久化。需要强持久化保证时，调用 `wait_flush()` 或改用 `flush()`。
+- **重复调用 `flush_async()` 是安全的。** 旧 JoinHandle 被替换后，旧背景线程仍在运行、会正常完成；但旧 flush 的返回值（成功/错误）将无法再被收集。如需感知错误，在下次 `flush_async()` 前先调 `wait_flush()`。
+- `flush_async()` 仅适用于**持久化模式**；内存模式直接返回。
+
+---
+
 ## 版本历史
 
 | 版本 | 写入链路主要变更 |
 |------|-----------------|
-| v0.5.0 | 字典编码（term→u32）；Vec 索引本地词汇；单 scope 流水线；Phase 2 l2g 映射；DashMap 64 分片 |
+| v0.5.x | `flush_async()` / `wait_flush()`；`LsmSingleIndex.data` 改为 `DashMap`（并行读写）；`flush_internal` / `merge_into_data` 并行写入；批量路径同步 `id_to_str` |
+| v0.6.0 | 字典编码（term→u32）；Vec 索引本地词汇；单 scope 流水线；Phase 2 l2g 映射；DashMap 64 分片 |
 | v0.3.x | 基于字符串键的 DashMap buffer；两段式 thread::scope |
 | v0.2.x | 单线程写入路径 |

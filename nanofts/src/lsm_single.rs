@@ -29,6 +29,8 @@
 use crate::bitmap::FastBitmap;
 use crate::vbyte;
 use crate::wal::{WriteAheadLog, WalOp};
+use dashmap::DashMap;
+use fork_union::spawn;
 use lru::LruCache;
 use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxHashMap;
@@ -88,8 +90,8 @@ pub struct LsmSingleIndex {
     path: PathBuf,
     file: RwLock<File>,
     header: RwLock<FileHeader>,
-    /// Loaded data blocks (full load mode)
-    data: RwLock<FxHashMap<String, FastBitmap>>,
+    /// Loaded data blocks (full load mode) — DashMap for lock-free parallel reads/writes
+    data: DashMap<String, FastBitmap>,
     /// Term index directory (lazy load mode)
     term_index: RwLock<FxHashMap<String, TermIndexEntry>>,
     /// LRU cache (lazy load mode)
@@ -170,7 +172,7 @@ impl LsmSingleIndex {
             path,
             file: RwLock::new(file),
             header: RwLock::new(header),
-            data: RwLock::new(FxHashMap::default()),
+            data: DashMap::new(),
             term_index: RwLock::new(FxHashMap::default()),
             cache: Mutex::new(LruCache::new(cache_cap)),
             cache_hits: AtomicU64::new(0),
@@ -228,7 +230,7 @@ impl LsmSingleIndex {
         let cache_cap = NonZeroUsize::new(cache_size.max(1)).unwrap();
         
         // Load data based on mode
-        let (data, term_index) = if lazy_load {
+        let (data_map, term_index) = if lazy_load {
             // Lazy load mode: only load index directory
             let index = Self::load_term_index(&mut file, &header)?;
             (FxHashMap::default(), index)
@@ -238,7 +240,7 @@ impl LsmSingleIndex {
             (data, FxHashMap::default())
         };
         
-        let mut data = data;
+        let mut data_map = data_map;
         
         // Initialize WAL and recover incomplete writes
         let wal = if enable_wal {
@@ -255,12 +257,12 @@ impl LsmSingleIndex {
                                 for entry in batch.entries {
                                     match entry.op {
                                         WalOp::Add => {
-                                            data.entry(entry.term)
+                                            data_map.entry(entry.term)
                                                 .or_insert_with(FastBitmap::new)
                                                 .add(entry.doc_id);
                                         }
                                         WalOp::Remove => {
-                                            if let Some(bitmap) = data.get_mut(&entry.term) {
+                                            if let Some(bitmap) = data_map.get_mut(&entry.term) {
                                                 bitmap.remove(entry.doc_id);
                                             }
                                         }
@@ -280,11 +282,13 @@ impl LsmSingleIndex {
             None
         };
         
+        let data: DashMap<String, FastBitmap> = data_map.into_iter().collect();
+
         Ok(Self {
             path,
             file: RwLock::new(file),
             header: RwLock::new(header),
-            data: RwLock::new(data),
+            data,
             term_index: RwLock::new(term_index),
             cache: Mutex::new(LruCache::new(cache_cap)),
             cache_hits: AtomicU64::new(0),
@@ -616,7 +620,54 @@ impl LsmSingleIndex {
             Ok(0)
         }
     }
-    
+
+    /// Merge entries directly into in-memory `data` for immediate searchability.
+    /// No WAL write, no buffer write, no disk I/O.
+    /// Only effective in full-load mode (lazy_load=false); a no-op otherwise.
+    /// Intended for `flush_async`: make data searchable on the calling thread
+    /// before handing off the actual disk write to a background thread.
+    /// Uses fork_union parallel inserts for large batches.
+    pub fn merge_into_data(&self, entries: &[(String, FastBitmap)]) {
+        if self.lazy_load || entries.is_empty() {
+            return;
+        }
+        let n = entries.len();
+        let num_threads = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4)
+            .min(n)
+            .max(1);
+        let mut pool = spawn(num_threads);
+        pool.for_n(n, |prong| {
+            let (term, bitmap) = &entries[prong.task_index];
+            self.data.entry(term.clone())
+                .and_modify(|existing| existing.or_inplace(bitmap))
+                .or_insert_with(|| bitmap.clone());
+        });
+    }
+
+    /// Write entries into the write buffer without WAL and without triggering
+    /// the auto-flush threshold check. The caller must subsequently call
+    /// `flush()` to persist the data.
+    /// Intended for the background thread spawned by `flush_async`.
+    pub fn enqueue_for_flush(&self, entries: Vec<(String, FastBitmap)>) {
+        let mut buffer = self.buffer.write();
+        let mut added_size = 0usize;
+        for (term, bitmap) in entries {
+            let is_new = !buffer.contains_key(&term);
+            let bitmap_len = bitmap.len() as usize;
+            buffer.entry(term.clone())
+                .and_modify(|existing| existing.or_inplace(&bitmap))
+                .or_insert(bitmap);
+            if is_new {
+                added_size += 64 + term.len();
+            }
+            added_size += bitmap_len * 3;
+        }
+        drop(buffer);
+        *self.buffer_size.write() += added_size;
+    }
+
     pub fn get(&self, term: &str) -> Option<FastBitmap> {
         // 1. Query buffer (latest data)
         let buffer = self.buffer.read();
@@ -627,9 +678,8 @@ impl LsmSingleIndex {
         let persisted_result = if self.lazy_load {
             self.get_lazy(term)
         } else {
-            // Full load mode: read directly from memory
-            let data = self.data.read();
-            data.get(term).cloned()
+            // Full load mode: read directly from DashMap (no global lock)
+            self.data.get(term).map(|r| r.value().clone())
         };
         
         // 3. Merge results
@@ -749,6 +799,26 @@ impl LsmSingleIndex {
         
         *self.buffer_size.write() = 0;
         
+        // Full-load mode: merge into `data` immediately (before disk I/O) so that
+        // searches succeed even while the background flush thread is writing to disk.
+        // This eliminates the window where data is in neither buffer nor data.
+        // Uses fork_union parallel inserts via the sharded DashMap.
+        if !self.lazy_load {
+            let n = entries.len();
+            let num_threads = std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(4)
+                .min(n)
+                .max(1);
+            let mut pool = spawn(num_threads);
+            pool.for_n(n, |prong| {
+                let (term, bitmap) = &entries[prong.task_index];
+                self.data.entry(term.clone())
+                    .and_modify(|existing| existing.or_inplace(bitmap))
+                    .or_insert_with(|| bitmap.clone());
+            });
+        }
+        
         // Build block data
         let mut block = Vec::new();
         
@@ -799,7 +869,7 @@ impl LsmSingleIndex {
         drop(header);
         drop(file);
         
-        // Update in-memory data based on mode
+        // Update in-memory index structures based on mode (full-load already done above)
         if self.lazy_load {
             // Lazy load mode: update index directory and clear cache
             // Rescan file to get new offsets
@@ -818,15 +888,8 @@ impl LsmSingleIndex {
             // This is necessary because term_index now contains complete data from all blocks,
             // while cache may only have partial data
             self.cache.lock().clear();
-        } else {
-            // Full load mode: update in-memory data
-            let mut data = self.data.write();
-            for (term, bitmap) in entries {
-                data.entry(term)
-                    .and_modify(|existing| existing.or_inplace(&bitmap))
-                    .or_insert(bitmap);
-            }
         }
+        // Full load mode: `data` was already updated before disk I/O (see above)
         
         // Data persisted, clear WAL
         if let Some(ref wal) = self.wal {
@@ -898,10 +961,9 @@ impl LsmSingleIndex {
                     }
                 }
             } else {
-                // Full load mode: copy from in-memory data
-                let data = self.data.read();
-                for (term, bitmap) in data.iter() {
-                    let mut new_bitmap = bitmap.clone();
+                // Full load mode: copy from in-memory DashMap
+                for entry in self.data.iter() {
+                    let mut new_bitmap = entry.value().clone();
                     
                     // Apply deletions
                     for &doc_id in deleted_docs {
@@ -910,7 +972,7 @@ impl LsmSingleIndex {
                     
                     // Only write non-empty bitmaps
                     if !new_bitmap.is_empty() {
-                        new_index.buffer.write().insert(term.clone(), new_bitmap);
+                        new_index.buffer.write().insert(entry.key().clone(), new_bitmap);
                     }
                 }
             }
@@ -946,7 +1008,10 @@ impl LsmSingleIndex {
             self.clear_cache();
         } else {
             let new_data = Self::load_all_blocks(&mut file, &new_header)?;
-            *self.data.write() = new_data;
+            self.data.clear();
+            for (k, v) in new_data {
+                self.data.insert(k, v);
+            }
         }
         
         *self.file.write() = file;
@@ -959,7 +1024,7 @@ impl LsmSingleIndex {
         let persisted_count = if self.lazy_load {
             self.term_index.read().len()
         } else {
-            self.data.read().len()
+            self.data.len()
         };
         persisted_count + self.buffer.read().len()
     }
@@ -998,7 +1063,7 @@ impl LsmSingleIndex {
         if self.lazy_load {
             terms.extend(self.term_index.read().keys().cloned());
         } else {
-            terms.extend(self.data.read().keys().cloned());
+            terms.extend(self.data.iter().map(|r| r.key().clone()));
         }
         
         // Add buffer terms
@@ -1016,11 +1081,11 @@ impl LsmSingleIndex {
         }
         
         // Remove from loaded data
-        for entry in self.data.write().values_mut() {
+        self.data.iter_mut().for_each(|mut entry| {
             for &doc_id in doc_ids {
-                entry.remove(doc_id);
+                entry.value_mut().remove(doc_id);
             }
-        }
+        });
     }
 }
 

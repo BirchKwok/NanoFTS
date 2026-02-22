@@ -1,6 +1,6 @@
 [package]
 name = "nanofts"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 authors = ["Birch Kwok"]
 description = "High-performance full-text search engine in Rust"
@@ -29,6 +29,10 @@ required-features = []
 
 [[example]]
 name = "ingestion_compare"
+required-features = []
+
+[[example]]
+name = "flush_benchmark"
 required-features = []
 
 [dependencies]
