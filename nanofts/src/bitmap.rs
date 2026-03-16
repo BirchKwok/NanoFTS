@@ -3,7 +3,6 @@
 //! Wraps the roaring library and provides optimized batch operations
 
 use roaring::RoaringBitmap;
-use std::io::{Read, Write};
 use thiserror::Error;
 
 #[derive(Error, Debug)]

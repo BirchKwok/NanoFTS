@@ -1,6 +1,6 @@
 # NanoFTS Rust 写入性能指南
 
-本文档说明 NanoFTS v0.6.0 引擎在写入链路上引入的架构变更，以及如何正确使用 Rust API 以达到最优吞吐量。
+本文档说明 NanoFTS v0.7.0 引擎在写入链路上引入的架构变更，以及如何正确使用 Rust API 以达到最优吞吐量。
 
 ## 目录
 
@@ -16,7 +16,7 @@
 
 ## 架构变更概述
 
-v0.6.0 对批量写入路径进行了五项主要优化，整体吞吐量在真实场景下提升约 **3×**，峰值达到 **943 万文档/秒**：
+v0.7.0 对批量写入路径进行了五项主要优化，整体吞吐量在真实场景下提升约 **3×**，峰值达到 **943 万文档/秒**：
 
 | 优化项 | 变更前 | 变更后 | 收益 |
 |--------|--------|--------|------|
@@ -601,6 +601,6 @@ cargo run --example flush_benchmark --release
 | 版本 | 写入链路主要变更 |
 |------|-----------------|
 | v0.5.x | `flush_async()` / `wait_flush()`；`LsmSingleIndex.data` 改为 `DashMap`（并行读写）；`flush_internal` / `merge_into_data` 并行写入；批量路径同步 `id_to_str` |
-| v0.6.0 | 字典编码（term→u32）；Vec 索引本地词汇；单 scope 流水线；Phase 2 l2g 映射；DashMap 64 分片 |
+| v0.7.0 | 字典编码（term→u32）；Vec 索引本地词汇；单 scope 流水线；Phase 2 l2g 映射；DashMap 64 分片 |
 | v0.3.x | 基于字符串键的 DashMap buffer；两段式 thread::scope |
 | v0.2.x | 单线程写入路径 |

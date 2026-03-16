@@ -64,7 +64,7 @@ Add this to your project `Cargo.toml`:
 
 ```toml
 [dependencies]
-nanofts = "0.6.0"
+nanofts = "0.7.0"
 ```
 
 Optional features:

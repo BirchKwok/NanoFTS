@@ -571,12 +571,17 @@ impl LsmSingleIndex {
     
     /// Batch insert term-bitmap pairs (for flushing from UnifiedEngine's buffer)
     pub fn upsert_batch(&self, entries: Vec<(String, FastBitmap)>) {
-        // Batch write to WAL (if enabled)
+        // Batch write to WAL (if enabled) — collect all (term, doc_id) pairs
+        // and submit in one lock acquisition instead of per-pair locking
         if let Some(ref wal) = self.wal {
+            let mut wal_entries: Vec<(String, u32)> = Vec::new();
             for (term, bitmap) in &entries {
                 for doc_id in bitmap.iter() {
-                    wal.log_add(term, doc_id);
+                    wal_entries.push((term.clone(), doc_id));
                 }
+            }
+            if !wal_entries.is_empty() {
+                wal.log_add_batch(&wal_entries);
             }
             // Commit WAL batch
             if let Err(e) = wal.commit() {
@@ -802,51 +807,80 @@ impl LsmSingleIndex {
         // Full-load mode: merge into `data` immediately (before disk I/O) so that
         // searches succeed even while the background flush thread is writing to disk.
         // This eliminates the window where data is in neither buffer nor data.
-        // Uses fork_union parallel inserts via the sharded DashMap.
-        if !self.lazy_load {
-            let n = entries.len();
+        self.merge_into_data(&entries);
+        
+        // Build block data — serialize + compress each entry in parallel
+        let num_entries = entries.len();
+        let compressed_entries: Vec<Result<Vec<u8>, String>> = if num_entries > 64 {
+            // Parallel path: each scoped thread processes a chunk and returns results
             let num_threads = std::thread::available_parallelism()
-                .map(|p| p.get())
-                .unwrap_or(4)
-                .min(n)
-                .max(1);
-            let mut pool = spawn(num_threads);
-            pool.for_n(n, |prong| {
-                let (term, bitmap) = &entries[prong.task_index];
-                self.data.entry(term.clone())
-                    .and_modify(|existing| existing.or_inplace(bitmap))
-                    .or_insert_with(|| bitmap.clone());
+                .map(|p| p.get()).unwrap_or(4).min(num_entries).max(1);
+            let chunk_size = (num_entries + num_threads - 1) / num_threads;
+            let entries_ref = &entries;
+            let chunk_results: Vec<Vec<(usize, Result<Vec<u8>, String>)>> = std::thread::scope(|s| {
+                let handles: Vec<_> = (0..num_threads).filter_map(|t| {
+                    let start = t * chunk_size;
+                    if start >= num_entries { return None; }
+                    let end = (start + chunk_size).min(num_entries);
+                    Some(s.spawn(move || {
+                        let mut results = Vec::with_capacity(end - start);
+                        for i in start..end {
+                            let (_, bitmap) = &entries_ref[i];
+                            let serialized = if bitmap.len() < ROARING_THRESHOLD as u64 {
+                                let ids: Vec<u32> = bitmap.to_vec();
+                                let mut buf = Vec::new();
+                                vbyte::encode_sorted_u32_array(&ids, &mut buf);
+                                buf
+                            } else {
+                                bitmap.serialize().unwrap_or_default()
+                            };
+                            let res = zstd::encode_all(&serialized[..], 1)
+                                .map_err(|e| e.to_string());
+                            results.push((i, res));
+                        }
+                        results
+                    }))
+                }).collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
             });
-        }
-        
-        // Build block data
+            // Assemble results in original order
+            let mut all_results: Vec<Result<Vec<u8>, String>> = (0..num_entries).map(|_| Ok(Vec::new())).collect();
+            for chunk in chunk_results {
+                for (idx, res) in chunk {
+                    all_results[idx] = res;
+                }
+            }
+            all_results
+        } else {
+            // Sequential path for small batches
+            entries.iter().map(|(_, bitmap)| {
+                let serialized = if bitmap.len() < ROARING_THRESHOLD as u64 {
+                    let ids: Vec<u32> = bitmap.to_vec();
+                    let mut buf = Vec::new();
+                    vbyte::encode_sorted_u32_array(&ids, &mut buf);
+                    buf
+                } else {
+                    bitmap.serialize().unwrap_or_default()
+                };
+                zstd::encode_all(&serialized[..], 1).map_err(|e| e.to_string())
+            }).collect()
+        };
+
         let mut block = Vec::new();
-        
         // term_count
-        block.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-        
-        for (term, bitmap) in &entries {
+        block.extend_from_slice(&(num_entries as u32).to_le_bytes());
+
+        for (i, (term, _)) in entries.iter().enumerate() {
             // term_len + term
             block.extend_from_slice(&(term.len() as u16).to_le_bytes());
             block.extend_from_slice(term.as_bytes());
-            
-            // Serialize bitmap
-            let serialized = if bitmap.len() < ROARING_THRESHOLD as u64 {
-                let ids: Vec<u32> = bitmap.to_vec();
-                let mut buf = Vec::new();
-                vbyte::encode_sorted_u32_array(&ids, &mut buf);
-                buf
-            } else {
-                bitmap.serialize().unwrap_or_default()
-            };
-            
-            // Compress
-            let compressed = zstd::encode_all(&serialized[..], 1)
-                .map_err(|e| LsmSingleError::CompressionError(e.to_string()))?;
-            
+
+            let compressed = compressed_entries[i].as_ref()
+                .map_err(|e| LsmSingleError::CompressionError(e.clone()))?;
+
             // data_len + data
             block.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
-            block.extend(compressed);
+            block.extend_from_slice(compressed);
         }
         
         // Write to file

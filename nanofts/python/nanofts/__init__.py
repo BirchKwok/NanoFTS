@@ -36,7 +36,7 @@ except ImportError:
     )
 
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 
 class UnifiedEngine(_UnifiedEngine):
@@ -76,15 +76,11 @@ class UnifiedEngine(_UnifiedEngine):
         if text_columns is None:
             text_columns = [col for col in df.columns if col != id_column]
         
-        count = 0
-        for _, row in df.iterrows():
-            doc_id = int(row[id_column])
-            fields = {col: str(row[col]) for col in text_columns if col in row.index}
-            self.add_document(doc_id, fields)
-            count += 1
-        
+        doc_ids = df[id_column].astype(int).tolist()
+        columns = [(col, df[col].fillna('').astype(str).tolist()) for col in text_columns]
+        self.add_documents_columnar(doc_ids, columns)
         self.flush()
-        return count
+        return len(doc_ids)
     
     def from_polars(self, df, id_column='id', text_columns=None):
         """
@@ -111,15 +107,11 @@ class UnifiedEngine(_UnifiedEngine):
         if text_columns is None:
             text_columns = [col for col in df.columns if col != id_column]
         
-        count = 0
-        for row in df.iter_rows(named=True):
-            doc_id = int(row[id_column])
-            fields = {col: str(row[col]) for col in text_columns if col in row}
-            self.add_document(doc_id, fields)
-            count += 1
-        
+        doc_ids = df[id_column].cast(int).to_list()
+        columns = [(col, df[col].fill_null('').cast(str).to_list()) for col in text_columns]
+        self.add_documents_columnar(doc_ids, columns)
         self.flush()
-        return count
+        return len(doc_ids)
     
     def from_arrow(self, table, id_column='id', text_columns=None):
         """
@@ -145,19 +137,12 @@ class UnifiedEngine(_UnifiedEngine):
         if text_columns is None:
             text_columns = [col for col in table.column_names if col != id_column]
         
-        # Convert to Python dict list
         df_dict = table.to_pydict()
-        num_rows = len(df_dict[id_column])
-        
-        count = 0
-        for i in range(num_rows):
-            doc_id = int(df_dict[id_column][i])
-            fields = {col: str(df_dict[col][i]) for col in text_columns if col in df_dict}
-            self.add_document(doc_id, fields)
-            count += 1
-        
+        doc_ids = [int(x) for x in df_dict[id_column]]
+        columns = [(col, [str(x) if x is not None else '' for x in df_dict[col]]) for col in text_columns if col in df_dict]
+        self.add_documents_columnar(doc_ids, columns)
         self.flush()
-        return count
+        return len(doc_ids)
     
     def from_parquet(self, path, id_column='id', text_columns=None):
         """
@@ -256,18 +241,16 @@ class UnifiedEngine(_UnifiedEngine):
             return 0
         
         if text_columns is None:
-            # Infer text columns from first document
             text_columns = [k for k in data[0].keys() if k != id_column]
         
-        count = 0
-        for row in data:
-            doc_id = int(row[id_column])
-            fields = {col: str(row[col]) for col in text_columns if col in row}
-            self.add_document(doc_id, fields)
-            count += 1
-        
+        doc_ids = [int(row[id_column]) for row in data]
+        columns = [
+            (col, [str(row.get(col, '') or '') for row in data])
+            for col in text_columns
+        ]
+        self.add_documents_columnar(doc_ids, columns)
         self.flush()
-        return count
+        return len(doc_ids)
 
 
 def create_engine(

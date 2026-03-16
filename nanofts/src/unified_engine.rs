@@ -468,8 +468,6 @@ pub struct UnifiedEngine {
     memory_only: bool,
     lazy_load: bool,
     preloaded: std::sync::atomic::AtomicBool,
-    // Regex
-    chinese_pattern: regex::Regex,
     // Compact lock: compact gets write lock, flush gets read lock
     compact_lock: RwLock<()>,
     // Background flush handle (for flush_async)
@@ -500,9 +498,23 @@ impl UnifiedEngine {
         self.id_to_str.get(&id).map(|s| s.clone())
     }
 
-    /// Build a reverse mapping id→str from the global dict (used at flush time)
-    fn build_id_to_str_map(&self) -> FxHashMap<u32, String> {
-        self.dict.iter().map(|e| (*e.value(), e.key().clone())).collect()
+    /// Drain the in-memory buffer into a Vec of (term_string, bitmap) pairs,
+    /// returning the set of doc IDs that were flushed.
+    fn drain_buffer(&self) -> (Vec<(String, FastBitmap)>, std::collections::HashSet<u32>) {
+        let mut entries: Vec<(String, FastBitmap)> = Vec::new();
+        let mut flushed_doc_ids = std::collections::HashSet::new();
+        let keys: Vec<u32> = self.buffer.iter().map(|e| *e.key()).collect();
+        for key in keys {
+            if let Some((term_id, bitmap)) = self.buffer.remove(&key) {
+                if let Some(term_str) = self.id_to_str.get(&term_id) {
+                    for doc_id in bitmap.iter() {
+                        flushed_doc_ids.insert(doc_id);
+                    }
+                    entries.push((term_str.clone(), bitmap));
+                }
+            }
+        }
+        (entries, flushed_doc_ids)
     }
 
     /// Create unified search engine with configuration
@@ -549,7 +561,6 @@ impl UnifiedEngine {
             memory_only,
             lazy_load: config.lazy_load,
             preloaded: std::sync::atomic::AtomicBool::new(false),
-            chinese_pattern: regex::Regex::new(r"[\u4e00-\u9fff]+").unwrap(),
             compact_lock: RwLock::new(()),
             flush_handle: Mutex::new(None),
         })
@@ -604,10 +615,12 @@ impl UnifiedEngine {
             return Ok(0);
         }
         
-        // Clear deleted/updated markers for all docs
-        for (doc_id, _) in &docs {
-            self.deleted_docs.remove(doc_id);
-            self.updated_docs.remove(doc_id);
+        // Clear deleted/updated markers for all docs (skip if maps are empty)
+        if !self.deleted_docs.is_empty() || !self.updated_docs.is_empty() {
+            for (doc_id, _) in &docs {
+                self.deleted_docs.remove(doc_id);
+                self.updated_docs.remove(doc_id);
+            }
         }
         
         // Use optimized batch processing
@@ -659,10 +672,12 @@ impl UnifiedEngine {
             }
         }
         
-        // Clear deleted/updated markers for all docs
-        for doc_id in &doc_ids {
-            self.deleted_docs.remove(doc_id);
-            self.updated_docs.remove(doc_id);
+        // Clear deleted/updated markers for all docs (skip if maps are empty)
+        if !self.deleted_docs.is_empty() || !self.updated_docs.is_empty() {
+            for doc_id in &doc_ids {
+                self.deleted_docs.remove(doc_id);
+                self.updated_docs.remove(doc_id);
+            }
         }
         
         // Use optimized columnar batch processing
@@ -692,10 +707,12 @@ impl UnifiedEngine {
             )));
         }
         
-        // Clear deleted/updated markers for all docs
-        for doc_id in &doc_ids {
-            self.deleted_docs.remove(doc_id);
-            self.updated_docs.remove(doc_id);
+        // Clear deleted/updated markers for all docs (skip if maps are empty)
+        if !self.deleted_docs.is_empty() || !self.updated_docs.is_empty() {
+            for doc_id in &doc_ids {
+                self.deleted_docs.remove(doc_id);
+                self.updated_docs.remove(doc_id);
+            }
         }
         
         // Use optimized single-column batch processing
@@ -1218,22 +1235,7 @@ impl UnifiedEngine {
         if let Some(ref index) = self.index {
             let _lock = self.compact_lock.write();
             
-            let mut pending_entries: Vec<(String, FastBitmap)> = Vec::new();
-            let mut flushed_doc_ids = std::collections::HashSet::new();
-            {
-                let id_to_str_map = self.build_id_to_str_map();
-                let keys: Vec<u32> = self.buffer.iter().map(|e| *e.key()).collect();
-                for key in keys {
-                    if let Some((term_id, bitmap)) = self.buffer.remove(&key) {
-                        if let Some(term_str) = id_to_str_map.get(&term_id).cloned() {
-                            for doc_id in bitmap.iter() {
-                                flushed_doc_ids.insert(doc_id);
-                            }
-                            pending_entries.push((term_str, bitmap));
-                        }
-                    }
-                }
-            }
+            let (pending_entries, flushed_doc_ids) = self.drain_buffer();
             
             let deleted: Vec<u32> = self.deleted_docs.iter()
                 .map(|e| *e.key())
@@ -1253,31 +1255,14 @@ impl UnifiedEngine {
                 self.updated_docs.remove(&doc_id);
             }
             
-            {
-                let mut flushed_doc_ids = std::collections::HashSet::new();
-                let mut entries: Vec<(String, FastBitmap)> = Vec::new();
-                
-                let id_to_str_map2 = self.build_id_to_str_map();
-                let keys: Vec<u32> = self.buffer.iter().map(|e| *e.key()).collect();
-                for key in keys {
-                    if let Some((term_id, bitmap)) = self.buffer.remove(&key) {
-                        if let Some(term_str) = id_to_str_map2.get(&term_id).cloned() {
-                            for doc_id in bitmap.iter() {
-                                flushed_doc_ids.insert(doc_id);
-                            }
-                            entries.push((term_str, bitmap));
-                        }
-                    }
-                }
-                
-                if !entries.is_empty() {
-                    index.upsert_batch(entries);
-                    index.flush()
-                        .map_err(|e| EngineError::IndexError(e.to_string()))?;
-                    
-                    for doc_id in flushed_doc_ids {
-                        self.updated_docs.remove(&doc_id);
-                    }
+            // Drain any entries that arrived during compaction
+            let (extra_entries, extra_doc_ids) = self.drain_buffer();
+            if !extra_entries.is_empty() {
+                index.upsert_batch(extra_entries);
+                index.flush()
+                    .map_err(|e| EngineError::IndexError(e.to_string()))?;
+                for doc_id in extra_doc_ids {
+                    self.updated_docs.remove(&doc_id);
                 }
             }
             
@@ -1323,9 +1308,9 @@ impl UnifiedEngine {
         self.doc_terms.len()
     }
     
-    /// Get page count
+    /// Get page count (alias for segment_count)
     pub fn page_count(&self) -> usize {
-        self.index.as_ref().map_or(0, |i| i.segment_count())
+        self.segment_count()
     }
     
     /// Get segment count
@@ -1698,27 +1683,41 @@ impl UnifiedEngine {
 
 // ==================== Internal Methods ====================
 
-/// Thread-safe helper: get existing term ID or insert new one, with thread-local cache.
+/// Merge thread-local term dictionary and posting lists into global structures.
+/// Called at the end of each parallel worker's processing loop to avoid
+/// duplicating the l2g mapping + buffer merge logic across batch methods.
 #[inline]
-fn get_or_insert_term_id(
-    term: &str,
+fn merge_local_to_global(
+    local_dict: &FxHashMap<String, u32>,
+    local_terms: &[Vec<u32>],
     dict: &dashmap::DashMap<String, u32>,
-    next_id: &std::sync::atomic::AtomicU32,
-    local_cache: &mut FxHashMap<String, u32>,
-) -> u32 {
-    if let Some(&id) = local_cache.get(term) {
-        return id;
+    id_to_str: &dashmap::DashMap<u32, String>,
+    next_term_id: &std::sync::atomic::AtomicU32,
+    buffer: &DashMap<u32, FastBitmap>,
+) {
+    let mut l2g: Vec<u32> = vec![0u32; local_dict.len()];
+    for (term, &lid) in local_dict.iter() {
+        // Fast path: read-only lookup avoids String allocation when term already exists
+        let gid = if let Some(r) = dict.get(term.as_str()) {
+            *r.value()
+        } else {
+            // Slow path: only allocate when term is new
+            match dict.entry(term.to_string()) {
+                dashmap::mapref::entry::Entry::Occupied(e) => *e.get(),
+                dashmap::mapref::entry::Entry::Vacant(e) => {
+                    let id = next_term_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    e.insert(id);
+                    id_to_str.insert(id, term.to_string()); id
+                }
+            }
+        };
+        l2g[lid as usize] = gid;
     }
-    let id = match dict.entry(term.to_string()) {
-        dashmap::mapref::entry::Entry::Occupied(e) => *e.get(),
-        dashmap::mapref::entry::Entry::Vacant(e) => {
-            let new_id = next_id.fetch_add(1, Ordering::Relaxed);
-            e.insert(new_id);
-            new_id
+    for (lid, doc_ids) in local_terms.iter().enumerate() {
+        if !doc_ids.is_empty() {
+            buffer.entry(l2g[lid]).or_insert_with(FastBitmap::new).add_many(doc_ids);
         }
-    };
-    local_cache.insert(term.to_string(), id);
-    id
+    }
 }
 
 impl UnifiedEngine {
@@ -1764,23 +1763,7 @@ impl UnifiedEngine {
                             local_terms[lid as usize].push(*doc_id);
                         });
                     }
-                    let mut l2g: Vec<u32> = vec![0u32; local_dict.len()];
-                    for (term, &lid) in local_dict.iter() {
-                        let gid = match d2.entry(term.to_string()) {
-                            dashmap::mapref::entry::Entry::Occupied(e) => *e.get(),
-                            dashmap::mapref::entry::Entry::Vacant(e) => {
-                                let id = n2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                e.insert(id);
-                                i2.insert(id, term.to_string()); id
-                            }
-                        };
-                        l2g[lid as usize] = gid;
-                    }
-                    for (lid, doc_ids) in local_terms.iter().enumerate() {
-                        if !doc_ids.is_empty() {
-                            b2.entry(l2g[lid]).or_insert_with(FastBitmap::new).add_many(doc_ids);
-                        }
-                    }
+                    merge_local_to_global(&local_dict, &local_terms, d2, i2, n2, b2);
                 });
             }
         });
@@ -1821,23 +1804,7 @@ impl UnifiedEngine {
                             local_terms[lid as usize].push(doc_id);
                         });
                     }
-                    let mut l2g: Vec<u32> = vec![0u32; local_dict.len()];
-                    for (term, &lid) in local_dict.iter() {
-                        let gid = match d2.entry(term.to_string()) {
-                            dashmap::mapref::entry::Entry::Occupied(e) => *e.get(),
-                            dashmap::mapref::entry::Entry::Vacant(e) => {
-                                let id = n2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                e.insert(id);
-                                i2.insert(id, term.to_string()); id
-                            }
-                        };
-                        l2g[lid as usize] = gid;
-                    }
-                    for (lid, doc_ids) in local_terms.iter().enumerate() {
-                        if !doc_ids.is_empty() {
-                            b2.entry(l2g[lid]).or_insert_with(FastBitmap::new).add_many(doc_ids);
-                        }
-                    }
+                    merge_local_to_global(&local_dict, &local_terms, d2, i2, n2, b2);
                 });
             }
         });
@@ -1872,23 +1839,7 @@ impl UnifiedEngine {
                             local_terms[lid as usize].push(doc_id);
                         });
                     }
-                    let mut l2g: Vec<u32> = vec![0u32; local_dict.len()];
-                    for (term, &lid) in local_dict.iter() {
-                        let gid = match d2.entry(term.to_string()) {
-                            dashmap::mapref::entry::Entry::Occupied(e) => *e.get(),
-                            dashmap::mapref::entry::Entry::Vacant(e) => {
-                                let id = n2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                e.insert(id);
-                                i2.insert(id, term.to_string()); id
-                            }
-                        };
-                        l2g[lid as usize] = gid;
-                    }
-                    for (lid, doc_ids) in local_terms.iter().enumerate() {
-                        if !doc_ids.is_empty() {
-                            b2.entry(l2g[lid]).or_insert_with(FastBitmap::new).add_many(doc_ids);
-                        }
-                    }
+                    merge_local_to_global(&local_dict, &local_terms, d2, i2, n2, b2);
                 });
             }
         });
@@ -1932,23 +1883,7 @@ impl UnifiedEngine {
                             local_terms[lid as usize].push(doc_id);
                         });
                     }
-                    let mut l2g: Vec<u32> = vec![0u32; local_dict.len()];
-                    for (term, &lid) in local_dict.iter() {
-                        let gid = match d2.entry(term.to_string()) {
-                            dashmap::mapref::entry::Entry::Occupied(e) => *e.get(),
-                            dashmap::mapref::entry::Entry::Vacant(e) => {
-                                let id = n2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                e.insert(id);
-                                i2.insert(id, term.to_string()); id
-                            }
-                        };
-                        l2g[lid as usize] = gid;
-                    }
-                    for (lid, doc_ids) in local_terms.iter().enumerate() {
-                        if !doc_ids.is_empty() {
-                            b2.entry(l2g[lid]).or_insert_with(FastBitmap::new).add_many(doc_ids);
-                        }
-                    }
+                    merge_local_to_global(&local_dict, &local_terms, d2, i2, n2, b2);
                 });
             }
         });
@@ -1986,23 +1921,7 @@ impl UnifiedEngine {
                             local_terms[lid as usize].push(doc_id);
                         });
                     }
-                    let mut l2g: Vec<u32> = vec![0u32; local_dict.len()];
-                    for (term, &lid) in local_dict.iter() {
-                        let gid = match d2.entry(term.to_string()) {
-                            dashmap::mapref::entry::Entry::Occupied(e) => *e.get(),
-                            dashmap::mapref::entry::Entry::Vacant(e) => {
-                                let id = n2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                e.insert(id);
-                                i2.insert(id, term.to_string()); id
-                            }
-                        };
-                        l2g[lid as usize] = gid;
-                    }
-                    for (lid, doc_ids) in local_terms.iter().enumerate() {
-                        if !doc_ids.is_empty() {
-                            b2.entry(l2g[lid]).or_insert_with(FastBitmap::new).add_many(doc_ids);
-                        }
-                    }
+                    merge_local_to_global(&local_dict, &local_terms, d2, i2, n2, b2);
                 });
             }
         });
@@ -2012,7 +1931,7 @@ impl UnifiedEngine {
     /// Uses inline Chinese detection to avoid regex overhead
     /// Uses FxHashSet for O(1) deduplication instead of O(n log n) sort+dedup
     #[inline]
-    fn tokenize_fast(text: &str, _pattern: &regex::Regex, max_chinese_length: usize, min_term_length: usize) -> Vec<String> {
+    fn tokenize_fast(text: &str, max_chinese_length: usize, min_term_length: usize) -> Vec<String> {
         // Use FxHashSet for faster deduplication
         let mut terms_set: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
         
@@ -2159,7 +2078,7 @@ impl UnifiedEngine {
     
     
     fn add_text(&self, doc_id: u32, text: &str) {
-        let terms = Self::tokenize_fast(text, &self.chinese_pattern, self.max_chinese_length, self.min_term_length);
+        let terms = Self::tokenize_fast(text, self.max_chinese_length, self.min_term_length);
         
         let mut term_ids = if self.track_doc_terms { Vec::with_capacity(terms.len()) } else { Vec::new() };
         
@@ -2178,38 +2097,6 @@ impl UnifiedEngine {
         }
     }
     
-    fn tokenize(&self, text: &str) -> Vec<String> {
-        let mut terms = Vec::new();
-        let text_lower = text.to_lowercase();
-        
-        // Chinese n-gram
-        for cap in self.chinese_pattern.find_iter(&text_lower) {
-            let chinese = cap.as_str();
-            let chars: Vec<char> = chinese.chars().collect();
-            
-            for n in 2..=self.max_chinese_length.min(chars.len()) {
-                for i in 0..=chars.len().saturating_sub(n) {
-                let term: String = chars[i..i+n].iter().collect();
-                if term.len() >= self.min_term_length {
-                        terms.push(term);
-                    }
-                }
-            }
-        }
-        
-        // English tokenization - split by non-alphanumeric characters
-        let english_only = self.chinese_pattern.replace_all(&text_lower, " ");
-        for word in english_only.split(|c: char| !c.is_alphanumeric()) {
-            let word = word.trim();
-            if word.len() >= self.min_term_length {
-                terms.push(word.to_string());
-            }
-        }
-        
-        terms.sort();
-        terms.dedup();
-        terms
-    }
     
     fn search_internal(&self, query: &str) -> FastBitmap {
         let query_lower = query.to_lowercase();
@@ -2248,10 +2135,6 @@ impl UnifiedEngine {
         // If track_doc_terms enabled, validate each result's validity
         // Filter out documents whose current terms don't contain query words (old version data)
         if self.track_doc_terms && !self.doc_terms.is_empty() {
-            let query_terms: std::collections::HashSet<String> = self.tokenize(&query_lower)
-                .into_iter()
-                .collect();
-            
             let mut valid_ids = Vec::new();
             for doc_id in bitmap.iter() {
                 // If document has doc_terms record, check if it contains all query words
@@ -2318,7 +2201,7 @@ impl UnifiedEngine {
         }
         
         // Chinese n-gram search
-        if self.chinese_pattern.is_match(term) {
+        if term.chars().any(|c| Self::is_chinese_char(c)) {
             let chars: Vec<char> = term.chars().collect();
             if chars.len() >= 2 {
                 for n in 2..=self.max_chinese_length.min(chars.len()) {

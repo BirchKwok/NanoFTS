@@ -68,10 +68,6 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 // Core modules
 pub mod bitmap;
-pub mod cache;
-pub mod index;
-pub mod search;
-pub mod shard;
 pub mod simd_utils;
 pub mod vbyte;
 pub mod wal;
@@ -80,10 +76,6 @@ pub mod unified_engine;
 
 // Re-export core types
 pub use bitmap::{FastBitmap, BitmapError, fast_intersection, fast_union};
-pub use cache::*;
-pub use index::*;
-pub use search::*;
-pub use shard::*;
 pub use lsm_single::{LsmSingleIndex, LsmSingleError};
 pub use unified_engine::{
     UnifiedEngine,
