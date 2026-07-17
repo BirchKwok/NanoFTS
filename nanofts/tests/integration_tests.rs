@@ -239,6 +239,89 @@ fn test_delete_after_flush_excludes_from_search() {
     let _ = std::fs::remove_file(index_path.with_extension("nfts.wal"));
 }
 
+#[test]
+fn test_add_after_remove_and_flush_drops_old_terms() {
+    let temp_dir = std::env::temp_dir();
+    let index_path = temp_dir.join("test_add_after_remove_flush.nfts");
+    let _ = std::fs::remove_file(&index_path);
+    let _ = std::fs::remove_file(format!("{}.tok", index_path.to_str().unwrap()));
+    let _ = std::fs::remove_file(index_path.with_extension("nfts.wal"));
+    let _ = std::fs::remove_file({
+        let mut p = index_path.clone().into_os_string();
+        p.push(".tdir");
+        std::path::PathBuf::from(p)
+    });
+
+    let config = EngineConfig::persistent(index_path.to_str().unwrap())
+        .with_drop_if_exists(true)
+        .with_lazy_load(true)
+        .with_track_doc_terms(true);
+    let engine = UnifiedEngine::new(config).unwrap();
+
+    engine.add_document(1, create_doc("Doc", "original content")).unwrap();
+    engine.flush().unwrap();
+    engine.remove_document(1).unwrap();
+    engine.flush().unwrap();
+    engine.add_document(1, create_doc("Doc", "new content")).unwrap();
+    engine.flush().unwrap();
+
+    assert_eq!(engine.search("original").unwrap().total_hits(), 0);
+    assert!(engine.search("new").unwrap().contains(1));
+
+    drop(engine);
+    let _ = std::fs::remove_file(&index_path);
+    let _ = std::fs::remove_file(format!("{}.tok", index_path.to_str().unwrap()));
+    let _ = std::fs::remove_file(index_path.with_extension("nfts.wal"));
+}
+
+#[test]
+fn test_lazy_update_flush_chinese_terms_visible() {
+    // Regression: compact writes `.tdir`, then upsert+flush must invalidate it so
+    // updated docs remain visible for Chinese terms that already existed in the corpus.
+    let temp_dir = std::env::temp_dir();
+    let index_path = temp_dir.join("test_lazy_chinese_update.nfts");
+    let _ = std::fs::remove_file(&index_path);
+    let _ = std::fs::remove_file(format!("{}.tok", index_path.to_str().unwrap()));
+    let _ = std::fs::remove_file(index_path.with_extension("nfts.wal"));
+    let _ = std::fs::remove_file({
+        let mut p = index_path.clone().into_os_string();
+        p.push(".tdir");
+        std::path::PathBuf::from(p)
+    });
+
+    let config = EngineConfig::persistent(index_path.to_str().unwrap())
+        .with_drop_if_exists(true)
+        .with_lazy_load(true)
+        .with_track_doc_terms(true);
+    let engine = UnifiedEngine::new(config).unwrap();
+
+    engine
+        .add_document(1, create_doc("A", "全文搜索内容"))
+        .unwrap();
+    engine
+        .add_document(2, create_doc("B", "其他文档"))
+        .unwrap();
+    engine.flush().unwrap();
+    // Force a compact so `.tdir` exists before the update+flush path.
+    engine.compact().unwrap();
+
+    engine
+        .update_document(2, create_doc("B", "新的内容 New Content"))
+        .unwrap();
+    engine.flush().unwrap();
+
+    assert!(
+        engine.search("新的内容").unwrap().contains(2),
+        "Chinese terms from the update must be searchable after lazy compact+flush"
+    );
+    assert!(!engine.search("其他").unwrap().contains(2));
+
+    drop(engine);
+    let _ = std::fs::remove_file(&index_path);
+    let _ = std::fs::remove_file(format!("{}.tok", index_path.to_str().unwrap()));
+    let _ = std::fs::remove_file(index_path.with_extension("nfts.wal"));
+}
+
 // ============================================
 // Search Tests
 // ============================================

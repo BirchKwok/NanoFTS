@@ -27,7 +27,7 @@ from nanofts import (
     FuzzyConfig,        # Fuzzy search configuration class
     
     # Version
-    __version__,        # Current version "0.8.1"
+    __version__,        # Current version "0.8.2"
 )
 ```
 

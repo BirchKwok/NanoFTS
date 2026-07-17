@@ -1144,6 +1144,17 @@ impl LsmSingleIndex {
             // This is necessary because term_index now contains complete data from all blocks,
             // while cache may only have partial data
             self.cache.lock().clear();
+
+            // The `.tdir` sidecar is a snapshot from the last compact. Appending a new
+            // block makes it stale (e.g. updated docs re-added to existing Chinese terms
+            // would be invisible if we kept serving `.tdir`). Drop it so `get_lazy`
+            // falls back to the freshly rebuilt `term_index` until the next compact.
+            *self.term_dir.write() = None;
+            self.needs_rebuild.store(true, Ordering::SeqCst);
+            let tdir = self.tdir_path();
+            if tdir.exists() {
+                let _ = std::fs::remove_file(&tdir);
+            }
         }
         // Full load mode: `data` was already updated before disk I/O (see above)
         

@@ -545,15 +545,22 @@ class TestStatisticsConsistency:
             engine.add_document(i, {"content": f"delete tracking {i}"})
         engine.flush()
         
-        # 删除一些文档
+        # 删除一些文档（尚未 flush）：tombstone 应计入 deleted_count
         for i in range(20):
             engine.remove_document(i)
-        engine.flush()
         
         stats = engine.stats()
         assert stats.get("deleted_count", 0) >= 20
+        assert 0 not in engine.search("tracking").to_list()
         
-        # Compact 后删除计数应该重置
+        # flush 会 purge 并清除 tombstone；删除效果保留在 base 中
+        engine.flush()
+        stats_after_flush = engine.stats()
+        assert stats_after_flush.get("deleted_count", 0) == 0
+        assert 0 not in engine.search("tracking").to_list()
+        assert 30 in engine.search("tracking").to_list()
+        
+        # Compact 后删除计数仍为 0
         engine.compact()
         
         stats_after_compact = engine.stats()
