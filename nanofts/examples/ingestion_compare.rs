@@ -18,8 +18,8 @@ fn main() {
     
     // Pre-generate all test data to avoid allocation during timing
     println!("Generating test data...");
-    let all_doc_ids: Vec<Vec<u32>> = sizes.iter()
-        .map(|&size| (1..=size as u32).collect())
+    let all_doc_ids: Vec<Vec<u64>> = sizes.iter()
+        .map(|&size| (1..=size as u64).collect())
         .collect();
     
     let all_titles: Vec<Vec<String>> = sizes.iter()

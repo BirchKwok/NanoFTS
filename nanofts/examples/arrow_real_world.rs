@@ -80,8 +80,8 @@ fn main() {
         })
         .collect();
     
-    let all_doc_ids: Vec<Vec<u32>> = sizes.iter()
-        .map(|&size| (1..=size as u32).collect())
+    let all_doc_ids: Vec<Vec<u64>> = sizes.iter()
+        .map(|&size| (1..=size as u64).collect())
         .collect();
     
     // Simulate Arrow arrays

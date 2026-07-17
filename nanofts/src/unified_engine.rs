@@ -21,9 +21,11 @@
 //! println!("Found {} documents", result.total_hits());
 //! ```
 
+use crate::analyzer::{self, AnalyzedDocument, AnalyzerConfig};
 use crate::bitmap::FastBitmap;
+use crate::doc_tokens::{DocTokenStore, PackedDocTokens, RankedHit};
 use crate::lsm_single::LsmSingleIndex;
-use crate::simd_utils;
+use crate::query;
 use dashmap::DashMap;
 use fork_union::spawn;
 use parking_lot::{RwLock, Mutex};
@@ -105,7 +107,7 @@ impl ResultHandle {
     }
     
     /// Check if result contains document ID
-    pub fn contains(&self, doc_id: u32) -> bool {
+    pub fn contains(&self, doc_id: u64) -> bool {
         self.bitmap.contains(doc_id)
     }
     
@@ -115,17 +117,17 @@ impl ResultHandle {
     }
     
     /// Get top N document IDs
-    pub fn top(&self, n: usize) -> Vec<u32> {
+    pub fn top(&self, n: usize) -> Vec<u64> {
         self.bitmap.iter().take(n).collect()
     }
     
     /// Convert to vector of document IDs
-    pub fn to_list(&self) -> Vec<u32> {
+    pub fn to_list(&self) -> Vec<u64> {
         self.bitmap.to_vec()
     }
     
     /// Get page of results
-    pub fn page(&self, offset: usize, limit: usize) -> Vec<u32> {
+    pub fn page(&self, offset: usize, limit: usize) -> Vec<u64> {
         self.bitmap.iter().skip(offset).take(limit).collect()
     }
     
@@ -173,7 +175,7 @@ impl ResultHandle {
     }
     
     /// Get iterator over document IDs
-    pub fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+    pub fn iter(&self) -> impl Iterator<Item = u64> + '_ {
         self.bitmap.iter()
     }
 }
@@ -218,7 +220,7 @@ impl ResultHandle {
     }
     
     #[pyo3(name = "contains")]
-    fn contains_py(&self, doc_id: u32) -> bool {
+    fn contains_py(&self, doc_id: u64) -> bool {
         self.contains(doc_id)
     }
     
@@ -229,22 +231,22 @@ impl ResultHandle {
     
     #[pyo3(signature = (n=100))]
     #[pyo3(name = "top")]
-    fn top_py(&self, n: usize) -> Vec<u32> {
+    fn top_py(&self, n: usize) -> Vec<u64> {
         self.top(n)
     }
     
     #[pyo3(name = "to_list")]
-    fn to_list_py(&self) -> Vec<u32> {
+    fn to_list_py(&self) -> Vec<u64> {
         self.to_list()
     }
     
-    fn to_numpy<'py>(&self, py: pyo3::Python<'py>) -> pyo3::PyResult<pyo3::Bound<'py, numpy::PyArray1<u32>>> {
-        let ids: Vec<u32> = self.bitmap.to_vec();
+    fn to_numpy<'py>(&self, py: pyo3::Python<'py>) -> pyo3::PyResult<pyo3::Bound<'py, numpy::PyArray1<u64>>> {
+        let ids: Vec<u64> = self.bitmap.to_vec();
         Ok(numpy::PyArray1::from_vec_bound(py, ids))
     }
     
     #[pyo3(name = "page")]
-    fn page_py(&self, offset: usize, limit: usize) -> Vec<u32> {
+    fn page_py(&self, offset: usize, limit: usize) -> Vec<u64> {
         self.page(offset, limit)
     }
     
@@ -317,7 +319,7 @@ pub struct EngineConfig {
     pub fuzzy_threshold: f64,
     /// Fuzzy search maximum edit distance
     pub fuzzy_max_distance: usize,
-    /// Whether to track document terms (for efficient deletion)
+    /// Whether to track document terms (for efficient deletion, phrase queries, and BM25 ranking)
     pub track_doc_terms: bool,
     /// Whether to delete existing index file
     pub drop_if_exists: bool,
@@ -325,20 +327,23 @@ pub struct EngineConfig {
     pub lazy_load: bool,
     /// LRU cache size in lazy load mode
     pub cache_size: usize,
+    /// Maximum number of fuzzy-match term candidates to consider per query word
+    pub fuzzy_max_candidates: usize,
 }
 
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             index_file: String::new(),
-            max_chinese_length: 4,
+            max_chinese_length: 3,
             min_term_length: 2,
             fuzzy_threshold: 0.7,
             fuzzy_max_distance: 2,
-            track_doc_terms: false,
+            track_doc_terms: true,
             drop_if_exists: false,
             lazy_load: false,
             cache_size: 10000,
+            fuzzy_max_candidates: 20,
         }
     }
 }
@@ -446,22 +451,29 @@ pub struct UnifiedEngine {
     
     // Storage layer
     index: Option<Arc<LsmSingleIndex>>,
+    // Index file path (empty in memory-only mode); used to derive the `.tok` sidecar path.
+    index_file: String,
     // Memory buffer (memory-only mode or write buffer)
     buffer: DashMap<u32, FastBitmap>,
-    // Document-term mapping (for efficient deletion)
-    doc_terms: DashMap<u32, Vec<u32>>,
+    // Document-term mapping (for efficient deletion): doc_id -> term_ids
+    doc_terms: DashMap<u64, Vec<u32>>,
     track_doc_terms: bool,
-    // Deletion markers (tombstone)
-    deleted_docs: DashMap<u32, ()>,
-    // Updated documents (data in index should be ignored, use buffer data only)
-    updated_docs: DashMap<u32, ()>,
+    // Per-document token streams (global term ids) for phrase queries and BM25 ranking.
+    token_store: RwLock<DocTokenStore>,
+    // Deletion markers (tombstone): docs removed from live results entirely.
+    deleted_docs: RwLock<FastBitmap>,
+    // Shadow markers (ApexFTS-style): base (index) hits for these docs must be ignored,
+    // because the buffer (delta) holds their up-to-date content. Updated docs are shadowed
+    // (not removed), deleted docs are both shadowed and deleted.
+    shadowed_docs: RwLock<FastBitmap>,
     // Configuration
     max_chinese_length: usize,
-    min_term_length: usize,
+    // Analyzer configuration derived from max_chinese_length/min_term_length.
+    analyzer_config: AnalyzerConfig,
     fuzzy_config: RwLock<FuzzyConfig>,
     // Cache
     result_cache: DashMap<String, Arc<FastBitmap>>,
-    cache_enabled: bool,
+    cache_enabled: std::sync::atomic::AtomicBool,
     // Statistics
     stats: EngineStats,
     // Mode
@@ -492,15 +504,64 @@ impl UnifiedEngine {
         new_id
     }
     
-    /// Get the term string for a given ID
+    // ==================== Shadow/Delete Marker Helpers ====================
+    // ApexFTS-style base/delta shadow semantics:
+    // - `shadowed_docs`: base (on-disk index) postings for these doc ids must be ignored
+    //   because the buffer (delta) holds their latest content (or they were deleted).
+    // - `deleted_docs`: doc ids removed from live results entirely.
+    
+    /// Mark a document as shadowed (its base/index postings must be ignored).
     #[inline]
-    fn get_term_str(&self, id: u32) -> Option<String> {
-        self.id_to_str.get(&id).map(|s| s.clone())
+    fn mark_shadowed(&self, doc_id: u64) {
+        self.shadowed_docs.write().add(doc_id);
     }
-
+    
+    /// Mark a document as deleted (removed from live results).
+    #[inline]
+    fn mark_deleted(&self, doc_id: u64) {
+        self.deleted_docs.write().add(doc_id);
+    }
+    
+    /// Clear the shadow marker for a document (its base postings are trustworthy again).
+    #[inline]
+    fn clear_shadowed(&self, doc_id: u64) {
+        self.shadowed_docs.write().remove(doc_id);
+    }
+    
+    /// Clear the delete marker for a document (it is live again).
+    #[inline]
+    fn clear_deleted(&self, doc_id: u64) {
+        self.deleted_docs.write().remove(doc_id);
+    }
+    
+    /// Clear both shadow and delete markers for a batch of doc ids (used when (re-)adding
+    /// documents, since a freshly-(re)added document is live and its indexed base data,
+    /// if any, is about to be superseded by the new buffer content anyway).
+    fn clear_markers_for_docs(&self, doc_ids: &[u64]) {
+        if doc_ids.is_empty() {
+            return;
+        }
+        {
+            let mut deleted = self.deleted_docs.write();
+            if !deleted.is_empty() {
+                for &doc_id in doc_ids {
+                    deleted.remove(doc_id);
+                }
+            }
+        }
+        {
+            let mut shadowed = self.shadowed_docs.write();
+            if !shadowed.is_empty() {
+                for &doc_id in doc_ids {
+                    shadowed.remove(doc_id);
+                }
+            }
+        }
+    }
+    
     /// Drain the in-memory buffer into a Vec of (term_string, bitmap) pairs,
     /// returning the set of doc IDs that were flushed.
-    fn drain_buffer(&self) -> (Vec<(String, FastBitmap)>, std::collections::HashSet<u32>) {
+    fn drain_buffer(&self) -> (Vec<(String, FastBitmap)>, std::collections::HashSet<u64>) {
         let mut entries: Vec<(String, FastBitmap)> = Vec::new();
         let mut flushed_doc_ids = std::collections::HashSet::new();
         let keys: Vec<u32> = self.buffer.iter().map(|e| *e.key()).collect();
@@ -528,6 +589,7 @@ impl UnifiedEngine {
             
             let idx = if path.exists() && config.drop_if_exists {
                 std::fs::remove_file(&path)?;
+                let _ = std::fs::remove_file(format!("{}.tok", config.index_file));
                 LsmSingleIndex::create_full_options(&path, true, config.lazy_load, config.cache_size)
             } else if path.exists() {
                 LsmSingleIndex::open_full_options(&path, true, config.lazy_load, config.cache_size)
@@ -538,32 +600,41 @@ impl UnifiedEngine {
             Some(Arc::new(idx))
         };
         
-        Ok(Self {
+        let engine = Self {
             dict: Arc::new(dashmap::DashMap::with_shard_amount(64)),
             id_to_str: Arc::new(dashmap::DashMap::with_shard_amount(64)),
             next_term_id: std::sync::atomic::AtomicU32::new(1),
             index,
+            index_file: config.index_file.clone(),
             buffer: DashMap::with_shard_amount(64),
             doc_terms: DashMap::new(),
             track_doc_terms: config.track_doc_terms,
-            deleted_docs: DashMap::new(),
-            updated_docs: DashMap::new(),
+            token_store: RwLock::new(DocTokenStore::new()),
+            deleted_docs: RwLock::new(FastBitmap::new()),
+            shadowed_docs: RwLock::new(FastBitmap::new()),
             max_chinese_length: config.max_chinese_length,
-            min_term_length: config.min_term_length,
+            analyzer_config: AnalyzerConfig {
+                max_chinese_length: config.max_chinese_length,
+                min_term_length: config.min_term_length,
+            },
             fuzzy_config: RwLock::new(FuzzyConfig {
                 threshold: config.fuzzy_threshold,
                 max_distance: config.fuzzy_max_distance,
-                max_candidates: 20,
+                max_candidates: config.fuzzy_max_candidates,
             }),
             result_cache: DashMap::new(),
-            cache_enabled: true,
+            cache_enabled: std::sync::atomic::AtomicBool::new(true),
             stats: EngineStats::default(),
             memory_only,
             lazy_load: config.lazy_load,
             preloaded: std::sync::atomic::AtomicBool::new(false),
             compact_lock: RwLock::new(()),
             flush_handle: Mutex::new(None),
-        })
+        };
+        
+        engine.load_token_store()?;
+        
+        Ok(engine)
     }
     
     /// Create engine from raw parameters (used by Python bindings)
@@ -588,17 +659,17 @@ impl UnifiedEngine {
             drop_if_exists,
             lazy_load,
             cache_size,
+            fuzzy_max_candidates: 20,
         })
     }
     
     // ==================== Document Operations ====================
     
     /// Add single document
-    pub fn add_document(&self, doc_id: u32, fields: HashMap<String, String>) -> EngineResult<()> {
-        // If previously deleted, remove from deleted_docs
-        self.deleted_docs.remove(&doc_id);
-        // Also remove from updated_docs (may have been updated before)
-        self.updated_docs.remove(&doc_id);
+    pub fn add_document(&self, doc_id: u64, fields: HashMap<String, String>) -> EngineResult<()> {
+        // Document is live again: clear any prior delete/shadow markers.
+        self.clear_deleted(doc_id);
+        self.clear_shadowed(doc_id);
         
         let text: String = fields.values().cloned().collect::<Vec<_>>().join(" ");
         self.add_text(doc_id, &text);
@@ -609,19 +680,15 @@ impl UnifiedEngine {
     }
     
     /// Batch add documents - optimized parallel version using ForkUnion
-    pub fn add_documents(&self, docs: Vec<(u32, HashMap<String, String>)>) -> EngineResult<usize> {
+    pub fn add_documents(&self, docs: Vec<(u64, HashMap<String, String>)>) -> EngineResult<usize> {
         let count = docs.len();
         if count == 0 {
             return Ok(0);
         }
         
-        // Clear deleted/updated markers for all docs (skip if maps are empty)
-        if !self.deleted_docs.is_empty() || !self.updated_docs.is_empty() {
-            for (doc_id, _) in &docs {
-                self.deleted_docs.remove(doc_id);
-                self.updated_docs.remove(doc_id);
-            }
-        }
+        // Clear deleted/shadowed markers for all docs (live again)
+        let doc_ids: Vec<u64> = docs.iter().map(|(id, _)| *id).collect();
+        self.clear_markers_for_docs(&doc_ids);
         
         // Use optimized batch processing
         self.add_documents_batch_parallel(&docs);
@@ -654,7 +721,7 @@ impl UnifiedEngine {
     /// ```
     pub fn add_documents_columnar(
         &self, 
-        doc_ids: Vec<u32>, 
+        doc_ids: Vec<u64>, 
         columns: Vec<(String, Vec<String>)>
     ) -> EngineResult<usize> {
         let num_docs = doc_ids.len();
@@ -672,13 +739,8 @@ impl UnifiedEngine {
             }
         }
         
-        // Clear deleted/updated markers for all docs (skip if maps are empty)
-        if !self.deleted_docs.is_empty() || !self.updated_docs.is_empty() {
-            for doc_id in &doc_ids {
-                self.deleted_docs.remove(doc_id);
-                self.updated_docs.remove(doc_id);
-            }
-        }
+        // Clear deleted/shadowed markers for all docs (live again)
+        self.clear_markers_for_docs(&doc_ids);
         
         // Use optimized columnar batch processing
         self.add_documents_columnar_parallel(&doc_ids, &columns);
@@ -694,7 +756,7 @@ impl UnifiedEngine {
     /// # Arguments
     /// * `doc_ids` - Vector of document IDs
     /// * `texts` - Vector of text content, same length as doc_ids
-    pub fn add_documents_texts(&self, doc_ids: Vec<u32>, texts: Vec<String>) -> EngineResult<usize> {
+    pub fn add_documents_texts(&self, doc_ids: Vec<u64>, texts: Vec<String>) -> EngineResult<usize> {
         let num_docs = doc_ids.len();
         if num_docs == 0 {
             return Ok(0);
@@ -707,13 +769,8 @@ impl UnifiedEngine {
             )));
         }
         
-        // Clear deleted/updated markers for all docs (skip if maps are empty)
-        if !self.deleted_docs.is_empty() || !self.updated_docs.is_empty() {
-            for doc_id in &doc_ids {
-                self.deleted_docs.remove(doc_id);
-                self.updated_docs.remove(doc_id);
-            }
-        }
+        // Clear deleted/shadowed markers for all docs (live again)
+        self.clear_markers_for_docs(&doc_ids);
         
         // Use optimized single-column batch processing
         self.add_documents_texts_parallel(&doc_ids, &texts);
@@ -728,7 +785,7 @@ impl UnifiedEngine {
     /// avoiding the need to clone String data from Arrow buffers.
     /// 
     /// # Arguments
-    /// * `doc_ids` - Document IDs as u32 slice
+    /// * `doc_ids` - Document IDs as u64 slice
     /// * `columns` - Column data as vector of (field_name, string_slices) pairs
     /// 
     /// # Performance
@@ -751,7 +808,7 @@ impl UnifiedEngine {
     /// ```
     pub fn add_documents_arrow_str<'a>(
         &self,
-        doc_ids: &[u32],
+        doc_ids: &[u64],
         columns: Vec<(String, Vec<&'a str>)>,
     ) -> EngineResult<usize> {
         let num_docs = doc_ids.len();
@@ -769,11 +826,8 @@ impl UnifiedEngine {
             }
         }
         
-        // Clear deleted/updated markers
-        for doc_id in doc_ids {
-            self.deleted_docs.remove(doc_id);
-            self.updated_docs.remove(doc_id);
-        }
+        // Clear deleted/shadowed markers for all docs (live again)
+        self.clear_markers_for_docs(doc_ids);
         
         // Use optimized zero-copy batch processing
         self.add_documents_arrow_parallel(doc_ids, &columns);
@@ -787,11 +841,11 @@ impl UnifiedEngine {
     /// Fastest path for Arrow data - pre-concatenated text as string slices.
     /// 
     /// # Arguments
-    /// * `doc_ids` - Document IDs as u32 slice
+    /// * `doc_ids` - Document IDs as u64 slice
     /// * `texts` - Text content as string slices from Arrow StringArray
     pub fn add_documents_arrow_texts<'a>(
         &self,
-        doc_ids: &[u32],
+        doc_ids: &[u64],
         texts: &[&'a str],
     ) -> EngineResult<usize> {
         let num_docs = doc_ids.len();
@@ -806,11 +860,8 @@ impl UnifiedEngine {
             )));
         }
         
-        // Clear deleted/updated markers
-        for doc_id in doc_ids {
-            self.deleted_docs.remove(doc_id);
-            self.updated_docs.remove(doc_id);
-        }
+        // Clear deleted/shadowed markers for all docs (live again)
+        self.clear_markers_for_docs(doc_ids);
         
         // Use optimized zero-copy single-column processing
         self.add_documents_arrow_texts_parallel(doc_ids, texts);
@@ -820,11 +871,16 @@ impl UnifiedEngine {
     }
     
     /// Update document
-    pub fn update_document(&self, doc_id: u32, fields: HashMap<String, String>) -> EngineResult<()> {
-        // 1. Mark document as "updated" (ignore old data in index during search)
-        self.updated_docs.insert(doc_id, ());
+    pub fn update_document(&self, doc_id: u64, fields: HashMap<String, String>) -> EngineResult<()> {
+        // 1. Shadow the document: base (index) postings for it must be ignored during
+        //    search until its new content is flushed into the base. This makes it safe
+        //    to let the doc live in the buffer only, without any base/buffer coupling.
+        self.mark_shadowed(doc_id);
         
-        // 2. If track_doc_terms enabled, remove old terms from buffer
+        // 2. Ensure document not in deleted_docs (if previously deleted)
+        self.clear_deleted(doc_id);
+        
+        // 3. If track_doc_terms enabled, remove old terms from buffer
         if self.track_doc_terms {
             if let Some((_, terms)) = self.doc_terms.remove(&doc_id) {
                 for term in terms {
@@ -833,10 +889,8 @@ impl UnifiedEngine {
                     }
                 }
             }
+            self.token_store.write().remove(doc_id);
         }
-        
-        // 3. Ensure document not in deleted_docs (if previously deleted)
-        self.deleted_docs.remove(&doc_id);
         
         // 4. Add new content to buffer
         let text: String = fields.values().cloned().collect::<Vec<_>>().join(" ");
@@ -849,9 +903,11 @@ impl UnifiedEngine {
     }
     
     /// Delete document
-    pub fn remove_document(&self, doc_id: u32) -> EngineResult<()> {
-        // Add tombstone marker
-        self.deleted_docs.insert(doc_id, ());
+    pub fn remove_document(&self, doc_id: u64) -> EngineResult<()> {
+        // Shadow the document (ignore any base/index postings for it) AND tombstone it
+        // (remove it from live results entirely).
+        self.mark_shadowed(doc_id);
+        self.mark_deleted(doc_id);
         
         // If track_doc_terms enabled, also remove from buffer (improve memory efficiency)
         if self.track_doc_terms {
@@ -862,6 +918,7 @@ impl UnifiedEngine {
                     }
                 }
             }
+            self.token_store.write().remove(doc_id);
         }
         
         self.result_cache.clear();
@@ -869,7 +926,7 @@ impl UnifiedEngine {
     }
     
     /// Batch delete documents
-    pub fn remove_documents(&self, doc_ids: Vec<u32>) -> EngineResult<()> {
+    pub fn remove_documents(&self, doc_ids: Vec<u64>) -> EngineResult<()> {
         for doc_id in doc_ids {
             self.remove_document(doc_id)?;
         }
@@ -884,7 +941,7 @@ impl UnifiedEngine {
         self.stats.search_count.fetch_add(1, Ordering::Relaxed);
         
         // Check cache
-        if self.cache_enabled {
+        if self.cache_enabled.load(Ordering::Relaxed) {
             if let Some(cached) = self.result_cache.get(query) {
                 self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(ResultHandle {
@@ -899,7 +956,7 @@ impl UnifiedEngine {
         let bitmap = self.search_internal(query);
         let bitmap = Arc::new(bitmap);
         
-        if self.cache_enabled {
+        if self.cache_enabled.load(Ordering::Relaxed) {
             self.result_cache.insert(query.to_string(), bitmap.clone());
         }
         
@@ -939,6 +996,54 @@ impl UnifiedEngine {
             elapsed_ns: start.elapsed().as_nanos() as u64,
             fuzzy_used: true,
         })
+    }
+    
+    /// BM25-ranked search, returning up to `limit` hits ordered by descending score.
+    ///
+    /// Requires `track_doc_terms=true` in [`EngineConfig`] (per-document token streams
+    /// must be tracked to compute term frequencies and document lengths).
+    pub fn search_ranked(&self, query: &str, limit: usize) -> EngineResult<Vec<RankedHit>> {
+        if !self.track_doc_terms {
+            return Err(EngineError::InvalidArgument(
+                "search_ranked requires track_doc_terms=true".to_string(),
+            ));
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        
+        let (analyzed, postings, candidates) = self.search_candidates(query);
+        if analyzed.terms.is_empty() || candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        
+        let store = self.token_store.read();
+        let live_doc_count = store.live_doc_count().max(1) as f32;
+        let average_length = store.live_term_total() as f32 / live_doc_count;
+        
+        let mut query_term_ids: Vec<(u32, f32)> = Vec::with_capacity(analyzed.terms.len());
+        for (term, posting) in analyzed.terms.iter().zip(postings.iter()) {
+            if let Some(gid_ref) = self.dict.get(term.as_str()) {
+                let gid = *gid_ref;
+                let df = posting.len() as f32;
+                query_term_ids.push((gid, query::bm25_idf(live_doc_count, df)));
+            }
+        }
+        if query_term_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        
+        Ok(query::bm25_rank(&candidates, &query_term_ids, &store, average_length, limit))
+    }
+    
+    /// BM25-ranked search returning all matching hits (no limit).
+    pub fn search_scored(&self, query: &str) -> EngineResult<Vec<RankedHit>> {
+        self.search_ranked(query, usize::MAX)
+    }
+    
+    /// BM25-ranked search returning only the top-N document IDs.
+    pub fn search_top_n(&self, query: &str, n: usize) -> EngineResult<Vec<u64>> {
+        Ok(self.search_ranked(query, n)?.into_iter().map(|hit| hit.doc_id).collect())
     }
     
     /// Batch search - optimized parallel version using ForkUnion
@@ -1027,7 +1132,7 @@ impl UnifiedEngine {
     }
     
     /// Filter results
-    pub fn filter_by_ids(&self, result: &ResultHandle, allowed_ids: Vec<u32>) -> EngineResult<ResultHandle> {
+    pub fn filter_by_ids(&self, result: &ResultHandle, allowed_ids: Vec<u64>) -> EngineResult<ResultHandle> {
         let start = std::time::Instant::now();
         let filter = FastBitmap::from_iter(allowed_ids);
         let filtered = result.bitmap.and(&filter);
@@ -1041,7 +1146,7 @@ impl UnifiedEngine {
     }
     
     /// Exclude IDs
-    pub fn exclude_ids(&self, result: &ResultHandle, excluded_ids: Vec<u32>) -> EngineResult<ResultHandle> {
+    pub fn exclude_ids(&self, result: &ResultHandle, excluded_ids: Vec<u64>) -> EngineResult<ResultHandle> {
         let start = std::time::Instant::now();
         let exclude = FastBitmap::from_iter(excluded_ids);
         let filtered = result.bitmap.andnot(&exclude);
@@ -1102,16 +1207,24 @@ impl UnifiedEngine {
             let count = entries.len();
             
             if !entries.is_empty() {
-                // Clean updated_docs for all flushed documents.
-                for (_, bitmap) in &entries {
-                    for doc_id in bitmap.iter() {
-                        self.updated_docs.remove(&doc_id);
+                // Clean shadow markers for all flushed documents: their latest content is
+                // now in the base index, so base postings are trustworthy again.
+                {
+                    let mut shadowed = self.shadowed_docs.write();
+                    if !shadowed.is_empty() {
+                        for (_, bitmap) in &entries {
+                            for doc_id in bitmap.iter() {
+                                shadowed.remove(doc_id);
+                            }
+                        }
                     }
                 }
                 index.upsert_batch(entries);
                 index.flush()
                     .map_err(|e| EngineError::IndexError(e.to_string()))?;
             }
+            
+            self.save_token_store()?;
             
             Ok(count)
         } else {
@@ -1151,10 +1264,16 @@ impl UnifiedEngine {
 
             self.result_cache.clear();
 
-            // Pre-clean updated_docs for all flushed documents.
-            for (_, bitmap) in &entries {
-                for doc_id in bitmap.iter() {
-                    self.updated_docs.remove(&doc_id);
+            // Pre-clean shadow markers for all flushed documents: their latest content is
+            // about to become part of the base index (via merge_into_data below).
+            {
+                let mut shadowed = self.shadowed_docs.write();
+                if !shadowed.is_empty() {
+                    for (_, bitmap) in &entries {
+                        for doc_id in bitmap.iter() {
+                            shadowed.remove(doc_id);
+                        }
+                    }
                 }
             }
 
@@ -1199,6 +1318,9 @@ impl UnifiedEngine {
                     .map_err(|e| EngineError::IndexError(e));
                 // Invalidate any cached results that were computed while disk write was in flight
                 self.result_cache.clear();
+                if result.is_ok() {
+                    self.save_token_store()?;
+                }
                 result
             }
             None => Ok(0),
@@ -1235,12 +1357,16 @@ impl UnifiedEngine {
         if let Some(ref index) = self.index {
             let _lock = self.compact_lock.write();
             
-            let (pending_entries, flushed_doc_ids) = self.drain_buffer();
+            let (pending_entries, _flushed_doc_ids) = self.drain_buffer();
             
-            let deleted: Vec<u32> = self.deleted_docs.iter()
-                .map(|e| *e.key())
-                .chain(self.updated_docs.iter().map(|e| *e.key()))
-                .collect();
+            // Docs to strip from the rewritten base: tombstoned docs (removed for good) and
+            // shadowed docs (their base postings are stale; fresh content lives in the
+            // buffer and gets re-upserted right below via pending/extra entries).
+            let deleted: Vec<u64> = {
+                let mut combined = self.deleted_docs.read().clone();
+                combined.or_inplace(&self.shadowed_docs.read());
+                combined.to_vec()
+            };
             
             index.compact_with_deletions(&deleted)
                 .map_err(|e| EngineError::IndexError(e.to_string()))?;
@@ -1251,24 +1377,51 @@ impl UnifiedEngine {
                     .map_err(|e| EngineError::IndexError(e.to_string()))?;
             }
             
-            for doc_id in flushed_doc_ids {
-                self.updated_docs.remove(&doc_id);
-            }
-            
             // Drain any entries that arrived during compaction
-            let (extra_entries, extra_doc_ids) = self.drain_buffer();
+            let (extra_entries, _extra_doc_ids) = self.drain_buffer();
             if !extra_entries.is_empty() {
                 index.upsert_batch(extra_entries);
                 index.flush()
                     .map_err(|e| EngineError::IndexError(e.to_string()))?;
-                for doc_id in extra_doc_ids {
-                    self.updated_docs.remove(&doc_id);
-                }
             }
             
-            self.deleted_docs.clear();
-            self.updated_docs.clear();
+            // compact_with_deletions rewrote the base cleanly with all tombstoned/shadowed
+            // docs stripped, and any fresh buffer content was re-upserted above, so every
+            // marker can be reset in one shot.
+            *self.deleted_docs.write() = FastBitmap::new();
+            *self.shadowed_docs.write() = FastBitmap::new();
+            
+            self.save_token_store()?;
         }
+        Ok(())
+    }
+    
+    /// Compact the token store to a packed base and write it atomically to `{index_file}.tok`.
+    /// No-op in memory-only mode or when `track_doc_terms` is disabled.
+    fn save_token_store(&self) -> EngineResult<()> {
+        if !self.track_doc_terms || self.index_file.is_empty() {
+            return Ok(());
+        }
+        let tok_path = format!("{}.tok", self.index_file);
+        let packed = self.token_store.read().compact_to_packed();
+        crate::persist::durable_write(std::path::Path::new(&tok_path), &packed.to_bytes())?;
+        Ok(())
+    }
+    
+    /// Load a previously-saved `{index_file}.tok` sidecar (if present) into the token store.
+    /// No-op in memory-only mode or when `track_doc_terms` is disabled.
+    fn load_token_store(&self) -> EngineResult<()> {
+        if !self.track_doc_terms || self.index_file.is_empty() {
+            return Ok(());
+        }
+        let tok_path = format!("{}.tok", self.index_file);
+        if !std::path::Path::new(&tok_path).exists() {
+            return Ok(());
+        }
+        let bytes = std::fs::read(&tok_path)?;
+        let packed = PackedDocTokens::from_bytes(&bytes)
+            .map_err(|e| EngineError::IndexError(e.to_string()))?;
+        self.token_store.write().replace_base(packed);
         Ok(())
     }
     
@@ -1277,6 +1430,14 @@ impl UnifiedEngine {
     /// Clear result cache
     pub fn clear_cache(&self) {
         self.result_cache.clear();
+    }
+
+    /// Enable or disable the query result cache (enabled by default).
+    pub fn set_result_cache_enabled(&self, enabled: bool) {
+        self.cache_enabled.store(enabled, Ordering::Relaxed);
+        if !enabled {
+            self.result_cache.clear();
+        }
     }
     
     /// Clear doc terms
@@ -1341,7 +1502,8 @@ impl UnifiedEngine {
         map.insert("result_cache_size".to_string(), self.result_cache.len() as f64);
         map.insert("buffer_size".to_string(), self.buffer.len() as f64);
         map.insert("term_count".to_string(), self.term_count() as f64);
-        map.insert("deleted_count".to_string(), self.deleted_docs.len() as f64);
+        map.insert("deleted_count".to_string(), self.deleted_docs.read().len() as f64);
+        map.insert("shadowed_count".to_string(), self.shadowed_docs.read().len() as f64);
         map.insert("memory_only".to_string(), if self.memory_only { 1.0 } else { 0.0 });
         map.insert("lazy_load".to_string(), if self.lazy_load { 1.0 } else { 0.0 });
         map.insert("track_doc_terms".to_string(), if self.track_doc_terms { 1.0 } else { 0.0 });
@@ -1350,6 +1512,7 @@ impl UnifiedEngine {
             map.insert("wal_enabled".to_string(), if index.is_wal_enabled() { 1.0 } else { 0.0 });
             map.insert("wal_size".to_string(), index.wal_size() as f64);
             map.insert("wal_pending_batches".to_string(), index.wal_pending_batches() as f64);
+            map.insert("needs_rebuild".to_string(), if index.needs_rebuild() { 1.0 } else { 0.0 });
             
             if index.is_lazy_load() {
                 let (lru_hits, lru_misses, lru_size) = index.cache_stats();
@@ -1357,6 +1520,7 @@ impl UnifiedEngine {
                 map.insert("lru_cache_misses".to_string(), lru_misses as f64);
                 map.insert("lru_cache_size".to_string(), lru_size as f64);
                 map.insert("lru_cache_hit_rate".to_string(), index.cache_hit_rate());
+                map.insert("term_dir_loaded".to_string(), if index.term_dir_loaded() { 1.0 } else { 0.0 });
             }
         }
         
@@ -1365,12 +1529,20 @@ impl UnifiedEngine {
     
     /// Get deleted document count
     pub fn deleted_count(&self) -> usize {
-        self.deleted_docs.len()
+        self.deleted_docs.read().len() as usize
     }
     
     /// Whether lazy load is enabled
     pub fn is_lazy_load(&self) -> bool {
         self.lazy_load
+    }
+    
+    /// True when the on-disk index recommends a `compact()` call to rebuild its
+    /// lazy-load term directory sidecar (missing, stale, or corrupt). Safe to
+    /// ignore — the engine transparently falls back to the slower lookup path —
+    /// but calling `compact()` restores the faster mmap-backed lazy-load path.
+    pub fn needs_rebuild(&self) -> bool {
+        self.index.as_ref().is_some_and(|i| i.needs_rebuild())
     }
     
     /// Warmup cache
@@ -1411,11 +1583,11 @@ impl UnifiedEngine {
     #[new]
     #[pyo3(signature = (
         index_file="".to_string(),
-        max_chinese_length=4,
+        max_chinese_length=3,
         min_term_length=2,
         fuzzy_threshold=0.7,
         fuzzy_max_distance=2,
-        track_doc_terms=false,
+        track_doc_terms=true,
         drop_if_exists=false,
         lazy_load=false,
         cache_size=10000
@@ -1445,12 +1617,12 @@ impl UnifiedEngine {
     }
     
     #[pyo3(name = "add_document")]
-    fn add_document_py(&self, doc_id: u32, fields: HashMap<String, String>) -> pyo3::PyResult<()> {
+    fn add_document_py(&self, doc_id: u64, fields: HashMap<String, String>) -> pyo3::PyResult<()> {
         self.add_document(doc_id, fields).map_err(Into::into)
     }
     
     #[pyo3(name = "add_documents")]
-    fn add_documents_py(&self, docs: Vec<(u32, HashMap<String, String>)>) -> pyo3::PyResult<usize> {
+    fn add_documents_py(&self, docs: Vec<(u64, HashMap<String, String>)>) -> pyo3::PyResult<usize> {
         self.add_documents(docs).map_err(Into::into)
     }
     
@@ -1478,7 +1650,7 @@ impl UnifiedEngine {
     #[pyo3(name = "add_documents_columnar")]
     fn add_documents_columnar_py(
         &self, 
-        doc_ids: Vec<u32>, 
+        doc_ids: Vec<u64>, 
         columns: Vec<(String, Vec<String>)>
     ) -> pyo3::PyResult<usize> {
         self.add_documents_columnar(doc_ids, columns).map_err(Into::into)
@@ -1504,22 +1676,22 @@ impl UnifiedEngine {
     /// engine.add_documents_texts(df['id'].tolist(), df['combined'].tolist())
     /// ```
     #[pyo3(name = "add_documents_texts")]
-    fn add_documents_texts_py(&self, doc_ids: Vec<u32>, texts: Vec<String>) -> pyo3::PyResult<usize> {
+    fn add_documents_texts_py(&self, doc_ids: Vec<u64>, texts: Vec<String>) -> pyo3::PyResult<usize> {
         self.add_documents_texts(doc_ids, texts).map_err(Into::into)
     }
     
     #[pyo3(name = "update_document")]
-    fn update_document_py(&self, doc_id: u32, fields: HashMap<String, String>) -> pyo3::PyResult<()> {
+    fn update_document_py(&self, doc_id: u64, fields: HashMap<String, String>) -> pyo3::PyResult<()> {
         self.update_document(doc_id, fields).map_err(Into::into)
     }
     
     #[pyo3(name = "remove_document")]
-    fn remove_document_py(&self, doc_id: u32) -> pyo3::PyResult<()> {
+    fn remove_document_py(&self, doc_id: u64) -> pyo3::PyResult<()> {
         self.remove_document(doc_id).map_err(Into::into)
     }
     
     #[pyo3(name = "remove_documents")]
-    fn remove_documents_py(&self, doc_ids: Vec<u32>) -> pyo3::PyResult<()> {
+    fn remove_documents_py(&self, doc_ids: Vec<u64>) -> pyo3::PyResult<()> {
         self.remove_documents(doc_ids).map_err(Into::into)
     }
     
@@ -1532,6 +1704,33 @@ impl UnifiedEngine {
     #[pyo3(name = "fuzzy_search")]
     fn fuzzy_search_py(&self, query: &str, min_results: usize) -> pyo3::PyResult<ResultHandle> {
         self.fuzzy_search(query, min_results).map_err(Into::into)
+    }
+    
+    /// BM25-ranked search returning a list of `(doc_id, score)` tuples ordered by
+    /// descending relevance. Requires `track_doc_terms=True`.
+    #[pyo3(signature = (query, limit=100))]
+    #[pyo3(name = "search_ranked")]
+    fn search_ranked_py(&self, query: &str, limit: usize) -> pyo3::PyResult<Vec<(u64, f32)>> {
+        Ok(self.search_ranked(query, limit)?
+            .into_iter()
+            .map(|hit| (hit.doc_id, hit.score))
+            .collect())
+    }
+    
+    /// BM25-ranked search returning all matching `(doc_id, score)` tuples (no limit).
+    #[pyo3(name = "search_scored")]
+    fn search_scored_py(&self, query: &str) -> pyo3::PyResult<Vec<(u64, f32)>> {
+        Ok(self.search_scored(query)?
+            .into_iter()
+            .map(|hit| (hit.doc_id, hit.score))
+            .collect())
+    }
+    
+    /// BM25-ranked search returning only the top-N document IDs.
+    #[pyo3(signature = (query, n=10))]
+    #[pyo3(name = "search_top_n")]
+    fn search_top_n_py(&self, query: &str, n: usize) -> pyo3::PyResult<Vec<u64>> {
+        self.search_top_n(query, n).map_err(Into::into)
     }
     
     #[pyo3(name = "search_batch")]
@@ -1550,12 +1749,12 @@ impl UnifiedEngine {
     }
     
     #[pyo3(name = "filter_by_ids")]
-    fn filter_by_ids_py(&self, result: &ResultHandle, allowed_ids: Vec<u32>) -> pyo3::PyResult<ResultHandle> {
+    fn filter_by_ids_py(&self, result: &ResultHandle, allowed_ids: Vec<u64>) -> pyo3::PyResult<ResultHandle> {
         self.filter_by_ids(result, allowed_ids).map_err(Into::into)
     }
     
     #[pyo3(name = "exclude_ids")]
-    fn exclude_ids_py(&self, result: &ResultHandle, excluded_ids: Vec<u32>) -> pyo3::PyResult<ResultHandle> {
+    fn exclude_ids_py(&self, result: &ResultHandle, excluded_ids: Vec<u64>) -> pyo3::PyResult<ResultHandle> {
         self.exclude_ids(result, excluded_ids).map_err(Into::into)
     }
     
@@ -1665,6 +1864,11 @@ impl UnifiedEngine {
     fn is_lazy_load_py(&self) -> bool {
         self.is_lazy_load()
     }
+
+    #[pyo3(name = "needs_rebuild")]
+    fn needs_rebuild_py(&self) -> bool {
+        self.needs_rebuild()
+    }
     
     #[pyo3(name = "warmup_terms")]
     fn warmup_terms_py(&self, terms: Vec<String>) -> usize {
@@ -1683,40 +1887,128 @@ impl UnifiedEngine {
 
 // ==================== Internal Methods ====================
 
+/// Estimate unique-term capacity for a worker chunk (high overlap across docs).
+#[inline]
+fn local_term_capacity(chunk_len: usize) -> usize {
+    chunk_len.saturating_mul(4).clamp(256, 65_536)
+}
+
 /// Merge thread-local term dictionary and posting lists into global structures.
-/// Called at the end of each parallel worker's processing loop to avoid
-/// duplicating the l2g mapping + buffer merge logic across batch methods.
+/// Takes `local_dict` by value so new terms can be moved into the global map
+/// (avoids an extra `String` clone on the insert path).
+/// Returns local-id → global-id mapping for token remap.
 #[inline]
 fn merge_local_to_global(
-    local_dict: &FxHashMap<String, u32>,
-    local_terms: &[Vec<u32>],
+    local_dict: FxHashMap<String, u32>,
+    mut local_terms: Vec<Vec<u64>>,
     dict: &dashmap::DashMap<String, u32>,
     id_to_str: &dashmap::DashMap<u32, String>,
     next_term_id: &std::sync::atomic::AtomicU32,
     buffer: &DashMap<u32, FastBitmap>,
-) {
-    let mut l2g: Vec<u32> = vec![0u32; local_dict.len()];
-    for (term, &lid) in local_dict.iter() {
-        // Fast path: read-only lookup avoids String allocation when term already exists
+) -> Vec<u32> {
+    let mut l2g = vec![0u32; local_terms.len()];
+    for (term, lid) in local_dict {
         let gid = if let Some(r) = dict.get(term.as_str()) {
             *r.value()
         } else {
-            // Slow path: only allocate when term is new
-            match dict.entry(term.to_string()) {
+            match dict.entry(term) {
                 dashmap::mapref::entry::Entry::Occupied(e) => *e.get(),
                 dashmap::mapref::entry::Entry::Vacant(e) => {
                     let id = next_term_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let owned = e.key().clone();
                     e.insert(id);
-                    id_to_str.insert(id, term.to_string()); id
+                    id_to_str.insert(id, owned);
+                    id
                 }
             }
         };
         l2g[lid as usize] = gid;
     }
-    for (lid, doc_ids) in local_terms.iter().enumerate() {
-        if !doc_ids.is_empty() {
-            buffer.entry(l2g[lid]).or_insert_with(FastBitmap::new).add_many(doc_ids);
+    for (lid, doc_ids) in local_terms.iter_mut().enumerate() {
+        if doc_ids.is_empty() {
+            continue;
         }
+        // Sorted append is much faster than per-id insert in RoaringTreemap::extend.
+        doc_ids.sort_unstable();
+        let gid = l2g[lid];
+        if let Some(mut bm) = buffer.get_mut(&gid) {
+            bm.add_many_sorted(doc_ids);
+        } else {
+            match buffer.entry(gid) {
+                dashmap::mapref::entry::Entry::Occupied(mut e) => {
+                    e.get_mut().add_many_sorted(doc_ids);
+                }
+                dashmap::mapref::entry::Entry::Vacant(e) => {
+                    e.insert(FastBitmap::from_sorted_slice(doc_ids));
+                }
+            }
+        }
+    }
+    l2g
+}
+
+/// Analyze one document's text, intern its (already-unique) terms into the thread-local
+/// dictionary, and — when `track_doc_terms` — record this doc's local term/token ids for
+/// later remap to global ids (see [`remap_and_store_tokens`]).
+///
+/// Takes `AnalyzedDocument` by value so term strings / token vectors can be moved
+/// (no per-term `clone()` on the ingest hot path).
+#[inline]
+fn analyze_and_intern_local(
+    doc_id: u64,
+    analyzed: AnalyzedDocument,
+    local_dict: &mut FxHashMap<String, u32>,
+    local_terms: &mut Vec<Vec<u64>>,
+    track_doc_terms: bool,
+    doc_tokens_local: &mut Vec<(u64, Vec<u32>, Vec<u32>)>,
+) {
+    if analyzed.terms.is_empty() {
+        if track_doc_terms {
+            doc_tokens_local.push((doc_id, Vec::new(), Vec::new()));
+        }
+        return;
+    }
+    let AnalyzedDocument { terms, tokens } = analyzed;
+    let mut term_lids: Vec<u32> = Vec::with_capacity(terms.len());
+    for term in terms {
+        let lid = if let Some(&id) = local_dict.get(term.as_str()) {
+            id
+        } else {
+            let id = local_terms.len() as u32;
+            local_dict.insert(term, id);
+            // Docs in a chunk are processed in order; reserve a small run for this term.
+            local_terms.push(Vec::with_capacity(8));
+            id
+        };
+        local_terms[lid as usize].push(doc_id);
+        term_lids.push(lid);
+    }
+    if track_doc_terms {
+        doc_tokens_local.push((doc_id, term_lids, tokens));
+    }
+}
+
+/// Remap thread-local (doc_id, term_lids, tokens) records to global term ids using `l2g`
+/// (produced by [`merge_local_to_global`]) and write them into `doc_terms` / `token_store`
+/// under a single write-lock acquisition.
+#[inline]
+fn remap_and_store_tokens(
+    doc_tokens_local: Vec<(u64, Vec<u32>, Vec<u32>)>,
+    l2g: &[u32],
+    doc_terms: &DashMap<u64, Vec<u32>>,
+    token_store: &RwLock<DocTokenStore>,
+) {
+    if doc_tokens_local.is_empty() {
+        return;
+    }
+    let mut store = token_store.write();
+    for (doc_id, term_lids, tokens) in doc_tokens_local {
+        let global_terms: Vec<u32> = term_lids.iter().map(|&lid| l2g[lid as usize]).collect();
+        let global_tokens: Vec<u32> = tokens.iter()
+            .map(|&t| if t == 0 { 0 } else { global_terms[t as usize - 1] })
+            .collect();
+        doc_terms.insert(doc_id, global_terms);
+        store.upsert(doc_id, global_tokens.into_boxed_slice());
     }
 }
 
@@ -1724,18 +2016,19 @@ impl UnifiedEngine {
     /// High-performance batch parallel document processing using ForkUnion
     /// 
     /// Optimization strategy:
-    /// 1. Parallel tokenization using ForkUnion thread pool
+    /// 1. Parallel analysis using ForkUnion thread pool
     /// 2. Thread-local HashMap collection to avoid lock contention
     /// 3. Single-pass merge into DashMap buffer
     /// 4. Optimized string handling to reduce allocations
-    fn add_documents_batch_parallel(&self, docs: &[(u32, HashMap<String, String>)]) {
+    fn add_documents_batch_parallel(&self, docs: &[(u64, HashMap<String, String>)]) {
         let num_docs = docs.len();
         if num_docs == 0 { return; }
         let num_threads = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4).max(1);
-        let max_chinese_len = self.max_chinese_length;
-        let min_term_len = self.min_term_length;
+        let cfg = self.analyzer_config;
+        let track_doc_terms = self.track_doc_terms;
         let chunk_size = (num_docs + num_threads - 1) / num_threads;
         let d2 = &self.dict; let i2 = &self.id_to_str; let n2 = &self.next_term_id; let b2 = &self.buffer;
+        let dt2 = &self.doc_terms; let tk2 = &self.token_store;
         std::thread::scope(|s| {
             for thread_idx in 0..num_threads {
                 let start = thread_idx * chunk_size;
@@ -1743,117 +2036,110 @@ impl UnifiedEngine {
                 let end = (start + chunk_size).min(num_docs);
                 let docs_slice = &docs[start..end];
                 s.spawn(move || {
-                    let mut text_buffer = String::with_capacity(256);
-                    let mut word_buf: Vec<u8> = Vec::with_capacity(256);
+                    let cap = local_term_capacity(docs_slice.len());
                     let mut local_dict: FxHashMap<String, u32> =
-                        FxHashMap::with_capacity_and_hasher(4096, Default::default());
-                    let mut local_terms: Vec<Vec<u32>> = Vec::with_capacity(4096);
+                        FxHashMap::with_capacity_and_hasher(cap, Default::default());
+                    let mut local_terms: Vec<Vec<u64>> = Vec::with_capacity(cap);
+                    let mut doc_tokens_local = Vec::with_capacity(if track_doc_terms { docs_slice.len() } else { 0 });
                     for (doc_id, fields) in docs_slice {
-                        text_buffer.clear();
-                        for (idx, value) in fields.values().enumerate() {
-                            if idx > 0 { text_buffer.push(' '); }
-                            text_buffer.push_str(value);
-                        }
-                        Self::tokenize_fast_cb(&text_buffer, max_chinese_len, min_term_len, &mut word_buf, |term| {
-                            let lid = if let Some(&id) = local_dict.get(term) { id } else {
-                                let id = local_terms.len() as u32;
-                                local_dict.insert(term.to_string(), id);
-                                local_terms.push(Vec::new()); id
-                            };
-                            local_terms[lid as usize].push(*doc_id);
-                        });
+                        let analyzed = analyzer::analyze_fields(
+                            fields.values().map(|s| s.as_str()),
+                            &cfg,
+                            track_doc_terms,
+                        );
+                        analyze_and_intern_local(*doc_id, analyzed, &mut local_dict, &mut local_terms, track_doc_terms, &mut doc_tokens_local);
                     }
-                    merge_local_to_global(&local_dict, &local_terms, d2, i2, n2, b2);
+                    let l2g = merge_local_to_global(local_dict, local_terms, d2, i2, n2, b2);
+                    if track_doc_terms {
+                        remap_and_store_tokens(doc_tokens_local, &l2g, dt2, tk2);
+                    }
                 });
             }
         });
     }
 
-    fn add_documents_columnar_parallel(&self, doc_ids: &[u32], columns: &[(String, Vec<String>)]) {
+    fn add_documents_columnar_parallel(&self, doc_ids: &[u64], columns: &[(String, Vec<String>)]) {
         let num_docs = doc_ids.len();
         if num_docs == 0 { return; }
         let num_threads = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4).max(1);
-        let max_chinese_len = self.max_chinese_length;
-        let min_term_len = self.min_term_length;
+        let cfg = self.analyzer_config;
+        let track_doc_terms = self.track_doc_terms;
         let chunk_size = (num_docs + num_threads - 1) / num_threads;
         let d2 = &self.dict; let i2 = &self.id_to_str; let n2 = &self.next_term_id; let b2 = &self.buffer;
+        let dt2 = &self.doc_terms; let tk2 = &self.token_store;
         std::thread::scope(|s| {
             for thread_idx in 0..num_threads {
                 let start = thread_idx * chunk_size;
                 if start >= num_docs { break; }
                 let end = (start + chunk_size).min(num_docs);
                 s.spawn(move || {
-                    let mut text_buffer = String::with_capacity(512);
-                    let mut word_buf: Vec<u8> = Vec::with_capacity(256);
+                    let cap = local_term_capacity(end - start);
                     let mut local_dict: FxHashMap<String, u32> =
-                        FxHashMap::with_capacity_and_hasher(4096, Default::default());
-                    let mut local_terms: Vec<Vec<u32>> = Vec::with_capacity(4096);
+                        FxHashMap::with_capacity_and_hasher(cap, Default::default());
+                    let mut local_terms: Vec<Vec<u64>> = Vec::with_capacity(cap);
+                    let mut doc_tokens_local = Vec::with_capacity(if track_doc_terms { end - start } else { 0 });
                     for idx in start..end {
                         let doc_id = doc_ids[idx];
-                        text_buffer.clear();
-                        for (col_idx, (_, values)) in columns.iter().enumerate() {
-                            if col_idx > 0 { text_buffer.push(' '); }
-                            text_buffer.push_str(&values[idx]);
-                        }
-                        Self::tokenize_fast_cb(&text_buffer, max_chinese_len, min_term_len, &mut word_buf, |term| {
-                            let lid = if let Some(&id) = local_dict.get(term) { id } else {
-                                let id = local_terms.len() as u32;
-                                local_dict.insert(term.to_string(), id);
-                                local_terms.push(Vec::new()); id
-                            };
-                            local_terms[lid as usize].push(doc_id);
-                        });
+                        let analyzed = analyzer::analyze_fields(
+                            columns.iter().map(|(_, values)| values[idx].as_str()),
+                            &cfg,
+                            track_doc_terms,
+                        );
+                        analyze_and_intern_local(doc_id, analyzed, &mut local_dict, &mut local_terms, track_doc_terms, &mut doc_tokens_local);
                     }
-                    merge_local_to_global(&local_dict, &local_terms, d2, i2, n2, b2);
+                    let l2g = merge_local_to_global(local_dict, local_terms, d2, i2, n2, b2);
+                    if track_doc_terms {
+                        remap_and_store_tokens(doc_tokens_local, &l2g, dt2, tk2);
+                    }
                 });
             }
         });
     }
 
-    fn add_documents_texts_parallel(&self, doc_ids: &[u32], texts: &[String]) {
+    fn add_documents_texts_parallel(&self, doc_ids: &[u64], texts: &[String]) {
         let num_docs = doc_ids.len();
         if num_docs == 0 { return; }
         let num_threads = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4).max(1);
-        let max_chinese_len = self.max_chinese_length;
-        let min_term_len = self.min_term_length;
+        let cfg = self.analyzer_config;
+        let track_doc_terms = self.track_doc_terms;
         let chunk_size = (num_docs + num_threads - 1) / num_threads;
         let d2 = &self.dict; let i2 = &self.id_to_str; let n2 = &self.next_term_id; let b2 = &self.buffer;
+        let dt2 = &self.doc_terms; let tk2 = &self.token_store;
         std::thread::scope(|s| {
             for thread_idx in 0..num_threads {
                 let start = thread_idx * chunk_size;
                 if start >= num_docs { break; }
                 let end = (start + chunk_size).min(num_docs);
                 s.spawn(move || {
-                    let mut word_buf: Vec<u8> = Vec::with_capacity(256);
+                    let cap = local_term_capacity(end - start);
                     let mut local_dict: FxHashMap<String, u32> =
-                        FxHashMap::with_capacity_and_hasher(4096, Default::default());
-                    let mut local_terms: Vec<Vec<u32>> = Vec::with_capacity(4096);
+                        FxHashMap::with_capacity_and_hasher(cap, Default::default());
+                    let mut local_terms: Vec<Vec<u64>> = Vec::with_capacity(cap);
+                    let mut doc_tokens_local = Vec::with_capacity(if track_doc_terms { end - start } else { 0 });
                     for idx in start..end {
                         let doc_id = doc_ids[idx];
-                        Self::tokenize_fast_cb(&texts[idx], max_chinese_len, min_term_len, &mut word_buf, |term| {
-                            let lid = if let Some(&id) = local_dict.get(term) { id } else {
-                                let id = local_terms.len() as u32;
-                                local_dict.insert(term.to_string(), id);
-                                local_terms.push(Vec::new()); id
-                            };
-                            local_terms[lid as usize].push(doc_id);
-                        });
+                        let analyzed = analyzer::analyze_query(&texts[idx], &cfg, track_doc_terms);
+                        analyze_and_intern_local(doc_id, analyzed, &mut local_dict, &mut local_terms, track_doc_terms, &mut doc_tokens_local);
                     }
-                    merge_local_to_global(&local_dict, &local_terms, d2, i2, n2, b2);
+                    let l2g = merge_local_to_global(local_dict, local_terms, d2, i2, n2, b2);
+                    if track_doc_terms {
+                        remap_and_store_tokens(doc_tokens_local, &l2g, dt2, tk2);
+                    }
                 });
             }
         });
     }
 
-    fn add_documents_arrow_parallel<'a>(&self, doc_ids: &[u32], columns: &[(String, Vec<&'a str>)]) {
+    fn add_documents_arrow_parallel<'a>(&self, doc_ids: &[u64], columns: &[(String, Vec<&'a str>)]) {
         let num_docs = doc_ids.len();
         if num_docs == 0 { return; }
         let num_threads = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4).max(1);
-        let max_chinese_len = self.max_chinese_length;
-        let min_term_len = self.min_term_length;
+        let cfg = self.analyzer_config;
+        let track_doc_terms = self.track_doc_terms;
         let chunk_size = (num_docs + num_threads - 1) / num_threads;
         let columns_slices: Vec<Vec<&'a str>> = columns.iter().map(|(_, v)| v.to_vec()).collect();
         let d2 = &self.dict; let i2 = &self.id_to_str; let n2 = &self.next_term_id; let b2 = &self.buffer;
+        let dt2 = &self.doc_terms; let tk2 = &self.token_store;
         std::thread::scope(|s| {
             for thread_idx in 0..num_threads {
                 let start = thread_idx * chunk_size;
@@ -1862,42 +2148,39 @@ impl UnifiedEngine {
                 let thread_columns: Vec<Vec<&'a str>> = columns_slices.iter()
                     .map(|v| v[start..end].to_vec()).collect();
                 s.spawn(move || {
-                    let mut text_buffer = String::with_capacity(512);
-                    let mut word_buf: Vec<u8> = Vec::with_capacity(256);
+                    let cap = local_term_capacity(end - start);
                     let mut local_dict: FxHashMap<String, u32> =
-                        FxHashMap::with_capacity_and_hasher(4096, Default::default());
-                    let mut local_terms: Vec<Vec<u32>> = Vec::with_capacity(4096);
+                        FxHashMap::with_capacity_and_hasher(cap, Default::default());
+                    let mut local_terms: Vec<Vec<u64>> = Vec::with_capacity(cap);
+                    let mut doc_tokens_local = Vec::with_capacity(if track_doc_terms { end - start } else { 0 });
                     for local_idx in 0..(end - start) {
                         let doc_id = doc_ids[start + local_idx];
-                        text_buffer.clear();
-                        for (col_idx, col_values) in thread_columns.iter().enumerate() {
-                            if col_idx > 0 { text_buffer.push(' '); }
-                            text_buffer.push_str(col_values[local_idx]);
-                        }
-                        Self::tokenize_fast_cb(&text_buffer, max_chinese_len, min_term_len, &mut word_buf, |term| {
-                            let lid = if let Some(&id) = local_dict.get(term) { id } else {
-                                let id = local_terms.len() as u32;
-                                local_dict.insert(term.to_string(), id);
-                                local_terms.push(Vec::new()); id
-                            };
-                            local_terms[lid as usize].push(doc_id);
-                        });
+                        let analyzed = analyzer::analyze_fields(
+                            thread_columns.iter().map(|col_values| col_values[local_idx]),
+                            &cfg,
+                            track_doc_terms,
+                        );
+                        analyze_and_intern_local(doc_id, analyzed, &mut local_dict, &mut local_terms, track_doc_terms, &mut doc_tokens_local);
                     }
-                    merge_local_to_global(&local_dict, &local_terms, d2, i2, n2, b2);
+                    let l2g = merge_local_to_global(local_dict, local_terms, d2, i2, n2, b2);
+                    if track_doc_terms {
+                        remap_and_store_tokens(doc_tokens_local, &l2g, dt2, tk2);
+                    }
                 });
             }
         });
     }
 
     /// Zero-copy parallel processing for Arrow single text column
-    fn add_documents_arrow_texts_parallel<'a>(&self, doc_ids: &[u32], texts: &[&'a str]) {
+    fn add_documents_arrow_texts_parallel<'a>(&self, doc_ids: &[u64], texts: &[&'a str]) {
         let num_docs = doc_ids.len();
         if num_docs == 0 { return; }
         let num_threads = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4).max(1);
-        let max_chinese_len = self.max_chinese_length;
-        let min_term_len = self.min_term_length;
+        let cfg = self.analyzer_config;
+        let track_doc_terms = self.track_doc_terms;
         let chunk_size = (num_docs + num_threads - 1) / num_threads;
         let d2 = &self.dict; let i2 = &self.id_to_str; let n2 = &self.next_term_id; let b2 = &self.buffer;
+        let dt2 = &self.doc_terms; let tk2 = &self.token_store;
         std::thread::scope(|s| {
             for thread_idx in 0..num_threads {
                 let start = thread_idx * chunk_size;
@@ -1906,342 +2189,154 @@ impl UnifiedEngine {
                 let texts_slice = &texts[start..end];
                 let doc_ids_slice = &doc_ids[start..end];
                 s.spawn(move || {
-                    let mut word_buf: Vec<u8> = Vec::with_capacity(256);
+                    let cap = local_term_capacity(end - start);
                     let mut local_dict: FxHashMap<String, u32> =
-                        FxHashMap::with_capacity_and_hasher(4096, Default::default());
-                    let mut local_terms: Vec<Vec<u32>> = Vec::with_capacity(4096);
+                        FxHashMap::with_capacity_and_hasher(cap, Default::default());
+                    let mut local_terms: Vec<Vec<u64>> = Vec::with_capacity(cap);
+                    let mut doc_tokens_local = Vec::with_capacity(if track_doc_terms { end - start } else { 0 });
                     for (local_idx, text) in texts_slice.iter().enumerate() {
                         let doc_id = doc_ids_slice[local_idx];
-                        Self::tokenize_fast_cb(text, max_chinese_len, min_term_len, &mut word_buf, |term| {
-                            let lid = if let Some(&id) = local_dict.get(term) { id } else {
-                                let id = local_terms.len() as u32;
-                                local_dict.insert(term.to_string(), id);
-                                local_terms.push(Vec::new()); id
-                            };
-                            local_terms[lid as usize].push(doc_id);
-                        });
+                        let analyzed = analyzer::analyze_query(text, &cfg, track_doc_terms);
+                        analyze_and_intern_local(doc_id, analyzed, &mut local_dict, &mut local_terms, track_doc_terms, &mut doc_tokens_local);
                     }
-                    merge_local_to_global(&local_dict, &local_terms, d2, i2, n2, b2);
+                    let l2g = merge_local_to_global(local_dict, local_terms, d2, i2, n2, b2);
+                    if track_doc_terms {
+                        remap_and_store_tokens(doc_tokens_local, &l2g, dt2, tk2);
+                    }
                 });
             }
         });
     }
 
-    /// Ultra-fast tokenization function optimized for batch processing
-    /// Uses inline Chinese detection to avoid regex overhead
-    /// Uses FxHashSet for O(1) deduplication instead of O(n log n) sort+dedup
-    #[inline]
-    fn tokenize_fast(text: &str, max_chinese_length: usize, min_term_length: usize) -> Vec<String> {
-        // Use FxHashSet for faster deduplication
-        let mut terms_set: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
-        
-        // Process character by character without collecting into Vec first
-        let mut chars_iter = text.chars().peekable();
-        let mut char_buf: Vec<char> = Vec::with_capacity(128);
-        
-        while let Some(c) = chars_iter.next() {
-            let c_lower = c.to_ascii_lowercase();
-            
-            // Fast inline Chinese character detection
-            if Self::is_chinese_char(c) {
-                // Collect Chinese sequence
-                    char_buf.clear();
-                char_buf.push(c);
-                while chars_iter.peek().map_or(false, |&next| Self::is_chinese_char(next)) {
-                    char_buf.push(chars_iter.next().unwrap());
-                }
-                
-                let chinese_len = char_buf.len();
-                
-                // Generate n-grams for Chinese
-                if chinese_len >= 2 {
-                    for n in 2..=max_chinese_length.min(chinese_len) {
-                        for j in 0..=chinese_len.saturating_sub(n) {
-                            let term: String = char_buf[j..j + n].iter().collect();
-                            terms_set.insert(term);
-                        }
-                    }
-                }
-            } else if c_lower.is_alphanumeric() {
-                // English/numeric word
-                char_buf.clear();
-                char_buf.push(c_lower);
-                while chars_iter.peek().map_or(false, |&next| {
-                    let next_lower = next.to_ascii_lowercase();
-                    next_lower.is_alphanumeric() && !Self::is_chinese_char(next)
-                }) {
-                    char_buf.push(chars_iter.next().unwrap().to_ascii_lowercase());
-                }
-                if char_buf.len() >= min_term_length {
-                    let term: String = char_buf.iter().collect();
-                    terms_set.insert(term);
-                }
-            }
-            // Skip non-alphanumeric characters implicitly
-        }
-        
-        // Convert to Vec
-        terms_set.into_iter().collect()
-    }
-    
-    /// Fast inline Chinese character detection
-    #[inline(always)]
-    fn is_chinese_char(c: char) -> bool {
-        matches!(c, '\u{4e00}'..='\u{9fff}')
-    }
+    fn add_text(&self, doc_id: u64, text: &str) {
+        let analyzed = analyzer::analyze_query(text, &self.analyzer_config, self.track_doc_terms);
 
-    /// Zero-allocation callback tokenizer.
-    /// Emits &str slices (from original text for Chinese n-grams, from word_buf for ASCII).
-    /// word_buf is a reusable scratch buffer for lowercase ASCII tokens.
-    #[inline]
-    fn tokenize_fast_cb(
-        text: &str,
-        max_chinese_length: usize,
-        min_term_length: usize,
-        word_buf: &mut Vec<u8>,
-        mut on_term: impl FnMut(&str),
-    ) {
-        let bytes = text.as_bytes();
-        let len = bytes.len();
-        let mut i = 0;
-
-        while i < len {
-            let b = bytes[i];
-            if b < 0x80 {
-                if b.is_ascii_alphanumeric() {
-                    word_buf.clear();
-                    let word_start = i;
-                    let mut needs_lower = false;
-                    while i < len && bytes[i] < 0x80 && bytes[i].is_ascii_alphanumeric() {
-                        let c = bytes[i];
-                        needs_lower |= c.is_ascii_uppercase();
-                        word_buf.push(c.to_ascii_lowercase());
-                        i += 1;
-                    }
-                    if word_buf.len() >= min_term_length {
-                        if needs_lower {
-                            // SAFETY: word_buf contains only ASCII lowercase bytes
-                            on_term(unsafe { std::str::from_utf8_unchecked(word_buf) });
-                        } else {
-                            on_term(&text[word_start..i]);
-                        }
-                    }
-                } else {
-                    i += 1;
-                }
-            } else if b >= 0xE4 && b <= 0xE9 && i + 2 < len {
-                // Possible CJK 3-byte UTF-8
-                let mut char_byte_offsets = [0usize; 64];
-                let mut n_chars = 0usize;
-                let seq_start = i;
-                while i < len && n_chars < 64 {
-                    let b0 = bytes[i];
-                    if b0 >= 0xE4 && b0 <= 0xE9 && i + 2 < len {
-                        let b1 = bytes[i + 1];
-                        let b2 = bytes[i + 2];
-                        let cp = ((b0 as u32 & 0x0F) << 12)
-                            | ((b1 as u32 & 0x3F) << 6)
-                            | (b2 as u32 & 0x3F);
-                        if cp >= 0x4E00 && cp <= 0x9FFF {
-                            char_byte_offsets[n_chars] = i - seq_start;
-                            n_chars += 1;
-                            i += 3;
-                            continue;
-                        }
-                    }
-                    break;
-                }
-                if n_chars >= 2 {
-                    for n in 2..=max_chinese_length.min(n_chars) {
-                        for j in 0..=n_chars.saturating_sub(n) {
-                            let s = seq_start + char_byte_offsets[j];
-                            let e = if j + n < n_chars {
-                                seq_start + char_byte_offsets[j + n]
-                            } else {
-                                i
-                            };
-                            on_term(&text[s..e]);
-                        }
-                    }
-                } else if n_chars == 0 {
-                    i += 3;
-                }
-            } else if b < 0xE0 {
-                i += 2;
-            } else if b < 0xF0 {
-                i += 3;
-            } else {
-                i += 4;
-            }
-        }
-    }
-    
-    
-    fn add_text(&self, doc_id: u32, text: &str) {
-        let terms = Self::tokenize_fast(text, self.max_chinese_length, self.min_term_length);
-        
-        let mut term_ids = if self.track_doc_terms { Vec::with_capacity(terms.len()) } else { Vec::new() };
-        
-        for term in &terms {
-            let term_id = self.get_term_id(term);
+        if analyzed.terms.is_empty() {
             if self.track_doc_terms {
-                term_ids.push(term_id);
+                self.doc_terms.insert(doc_id, Vec::new());
+                self.token_store.write().upsert(doc_id, Box::new([]));
             }
-            self.buffer.entry(term_id)
+            return;
+        }
+
+        let AnalyzedDocument { terms, tokens } = analyzed;
+        let mut global_ids: Vec<u32> = Vec::with_capacity(terms.len());
+        for term in &terms {
+            let gid = self.get_term_id(term);
+            self.buffer.entry(gid)
                 .or_insert_with(FastBitmap::new)
                 .add(doc_id);
+            global_ids.push(gid);
         }
-        
+
         if self.track_doc_terms {
-            self.doc_terms.insert(doc_id, term_ids);
+            let global_tokens: Vec<u32> = tokens.iter()
+                .map(|&local_id| if local_id == 0 { 0 } else { global_ids[local_id as usize - 1] })
+                .collect();
+            self.doc_terms.insert(doc_id, global_ids);
+            self.token_store.write().upsert(doc_id, global_tokens.into_boxed_slice());
         }
     }
     
+    /// Analyze `query`, resolve per-term postings, intersect them, optionally filter by
+    /// phrase position, and exclude tombstoned documents. Shared by [`search_internal`]
+    /// and the BM25 ranking APIs (which additionally need per-term document frequencies).
+    fn search_candidates(&self, query: &str) -> (AnalyzedDocument, Vec<FastBitmap>, FastBitmap) {
+        let (inner, is_phrase) = analyzer::phrase_query(query);
+        // Phrase needs positional tokens; boolean AND only needs the term set.
+        let analyzed = analyzer::analyze_query(inner, &self.analyzer_config, is_phrase);
+
+        if analyzed.terms.is_empty() {
+            return (analyzed, Vec::new(), FastBitmap::new());
+        }
+
+        // Take shadow snapshot once for the whole query (applied only to base postings).
+        let shadowed = self.shadowed_docs.read();
+        let mut postings = Vec::with_capacity(analyzed.terms.len());
+        for term in &analyzed.terms {
+            let posting = self.search_term_posting(term, &shadowed);
+            // AND semantics: any empty term makes the whole result empty.
+            if posting.is_empty() {
+                return (analyzed, Vec::new(), FastBitmap::new());
+            }
+            postings.push(posting);
+        }
+        drop(shadowed);
+
+        let mut bitmap = query::intersect_postings(&postings);
+
+        if !bitmap.is_empty() && is_phrase && self.track_doc_terms {
+            let query_tokens = query::map_query_tokens(&analyzed, |term| {
+                self.dict.get(term).map(|r| *r.value())
+            });
+            if !query_tokens.is_empty() {
+                let store = self.token_store.read();
+                bitmap = query::filter_phrase(&bitmap, &query_tokens, &store);
+            }
+        }
+
+        // Deleted can be applied once after intersection: (A-D)∩(B-D) = (A∩B)-D.
+        if !bitmap.is_empty() {
+            let deleted = self.deleted_docs.read();
+            if !deleted.is_empty() {
+                bitmap.andnot_inplace(&deleted);
+            }
+        }
+
+        (analyzed, postings, bitmap)
+    }
     
     fn search_internal(&self, query: &str) -> FastBitmap {
-        let query_lower = query.to_lowercase();
-        let words: Vec<&str> = query_lower.split_whitespace()
-            .filter(|w| w.len() >= self.min_term_length)
-            .collect();
-        
-        if words.is_empty() {
-            return FastBitmap::new();
-        }
-        
-        let mut result: Option<FastBitmap> = None;
-        
-        for word in &words {
-            let word_result = self.search_term(word);
-            
-            result = Some(match result {
-                Some(mut r) => { r.and_inplace(&word_result); r }
-                None => word_result,
-            });
-            
-            if result.as_ref().map_or(true, |r| r.is_empty()) {
-                return FastBitmap::new();
-            }
-        }
-        
-        let mut bitmap = result.unwrap_or_else(FastBitmap::new);
-        
-        // Exclude deleted documents (tombstone mechanism)
-        if !self.deleted_docs.is_empty() {
-            for entry in self.deleted_docs.iter() {
-                bitmap.remove(*entry.key());
-            }
-        }
-        
-        // If track_doc_terms enabled, validate each result's validity
-        // Filter out documents whose current terms don't contain query words (old version data)
-        if self.track_doc_terms && !self.doc_terms.is_empty() {
-            let mut valid_ids = Vec::new();
-            for doc_id in bitmap.iter() {
-                // If document has doc_terms record, check if it contains all query words
-                if let Some(terms) = self.doc_terms.get(&doc_id) {
-                    let doc_term_set: std::collections::HashSet<u32> = terms.iter().copied().collect();
-                    let mut all_match = true;
-                    for word in &words {
-                        let mut word_matched = false;
-                        if let Some(id_ref) = self.dict.get(&**word) {
-                            if doc_term_set.contains(&*id_ref) {
-                                word_matched = true;
-                            }
-                        }
-                        
-                        if !word_matched {
-                            for &term_id in &doc_term_set {
-                                if let Some(term_str) = self.get_term_str(term_id) {
-                                    if term_str.contains(word) {
-                                        word_matched = true;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        
-                        if !word_matched {
-                            all_match = false;
-                            break;
-                        }
-                    }
-                    if all_match {
-                        valid_ids.push(doc_id);
-                    }
-                } else {
-                    // Documents without doc_terms record are kept directly
-                    valid_ids.push(doc_id);
-                }
-            }
-            bitmap = FastBitmap::from_iter(valid_ids);
-        }
-        
-        bitmap
+        self.search_candidates(query).2
     }
-    
-    fn search_term(&self, term: &str) -> FastBitmap {
-        let mut result = FastBitmap::new();
-        
-        // Query buffer
-        if let Some(bitmap) = self.buffer.get(&self.get_term_id(term)) {
-            result.or_inplace(&bitmap);
-        }
-        
-        // Query index (exclude updated documents)
-        if let Some(ref index) = self.index {
-            if let Some(mut bitmap) = index.get(term) {
-                // Remove updated documents from index results (their data should come from buffer)
-                if !self.updated_docs.is_empty() {
-                    for entry in self.updated_docs.iter() {
-                        bitmap.remove(*entry.key());
-                    }
+
+    /// Resolve live postings for one term: `(base − shadow) ∪ delta`.
+    ///
+    /// Does **not** insert into the dictionary (search must be read-only w.r.t. vocab).
+    /// Chinese n-gram expansion is handled by the analyzer at query time — each n-gram
+    /// is already a separate term in `analyzed.terms` and gets intersected above.
+    fn search_term_posting(&self, term: &str, shadowed: &FastBitmap) -> FastBitmap {
+        let mut result = match self.index.as_ref().and_then(|index| index.get(term)) {
+            Some(mut base) => {
+                if !base.is_empty() && !shadowed.is_empty() {
+                    base.andnot_inplace(shadowed);
                 }
+                base
+            }
+            None => FastBitmap::new(),
+        };
+
+        if let Some(term_id) = self.dict.get(term) {
+            if let Some(bitmap) = self.buffer.get(&*term_id) {
                 result.or_inplace(&bitmap);
             }
         }
-        
-        // Chinese n-gram search
-        if term.chars().any(|c| Self::is_chinese_char(c)) {
-            let chars: Vec<char> = term.chars().collect();
-            if chars.len() >= 2 {
-                for n in 2..=self.max_chinese_length.min(chars.len()) {
-                    for i in 0..=chars.len().saturating_sub(n) {
-                        let ngram: String = chars[i..i+n].iter().collect();
-                        
-                        if let Some(ngram_id) = self.dict.get(&ngram) {
-                            if let Some(bitmap) = self.buffer.get(&*ngram_id) {
-                                if result.is_empty() {
-                                    result = bitmap.clone();
-                                } else {
-                                    result.and_inplace(&bitmap);
-                                }
-                            }
-                        }
-                        
-                        if let Some(ref index) = self.index {
-                            if let Some(bitmap) = index.get(ngram.as_str()) {
-                                if result.is_empty() {
-                                    result = bitmap;
-                                } else {
-                                    result.and_inplace(&bitmap);
-                                }
-                            }
-                        }
-                    }
-                }
+
+        result
+    }
+
+    /// Public-style helper used by fuzzy search: posting + deleted filter for a single term.
+    fn search_term(&self, term: &str) -> FastBitmap {
+        let shadowed = self.shadowed_docs.read();
+        let mut result = self.search_term_posting(term, &shadowed);
+        drop(shadowed);
+        if !result.is_empty() {
+            let deleted = self.deleted_docs.read();
+            if !deleted.is_empty() {
+                result.andnot_inplace(&deleted);
             }
         }
-        
         result
     }
     
     fn fuzzy_search_internal(&self, query: &str) -> FastBitmap {
         let config = self.fuzzy_config.read();
         let threshold = config.threshold;
+        let max_distance = config.max_distance;
         let max_candidates = config.max_candidates;
         drop(config);
         
-        // Collect all terms
+        // Collect unique terms from dictionary + index
         let mut all_terms: Vec<String> = self.dict.iter()
             .map(|e| e.key().clone())
             .collect();
@@ -2249,29 +2344,34 @@ impl UnifiedEngine {
         if let Some(ref index) = self.index {
             all_terms.extend(index.all_terms());
         }
+        all_terms.sort_unstable();
+        all_terms.dedup();
         
-        // Find similar terms
+        // Find similar terms: length/q-gram prune → early-exit Levenshtein
         let words: Vec<&str> = query.split_whitespace().collect();
         let mut result = FastBitmap::new();
         
         for word in words {
-            let mut candidates: Vec<(String, f64)> = all_terms.iter()
+            let pruned = crate::fuzzy::prune_fuzzy_candidates(&all_terms, word, max_distance);
+            let mut candidates: Vec<(&str, usize, f64)> = pruned
+                .into_iter()
                 .filter_map(|t| {
-                    let score = simd_utils::similarity_score(word, t);
-                    if score >= threshold {
-                        Some((t.clone(), score))
-                    } else {
-                        None
-                    }
+                    let distance = crate::analyzer::levenshtein(word, t, max_distance)?;
+                    let width = word.chars().count().max(t.chars().count()).max(1);
+                    let similarity = 1.0 - distance as f64 / width as f64;
+                    (similarity >= threshold).then_some((t, distance, similarity))
                 })
                 .collect();
             
-            candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            candidates.sort_by(|a, b| {
+                a.1.cmp(&b.1)
+                    .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+            });
             candidates.truncate(max_candidates);
             
             let mut word_result = FastBitmap::new();
-            for (term, _) in candidates {
-                let term_bitmap = self.search_term(&term);
+            for (term, _, _) in candidates {
+                let term_bitmap = self.search_term(term);
                 word_result.or_inplace(&term_bitmap);
             }
             
@@ -2311,11 +2411,11 @@ pub fn create_engine(config: EngineConfig) -> EngineResult<UnifiedEngine> {
 #[pyo3::pyfunction]
 #[pyo3(signature = (
     index_file="".to_string(),
-    max_chinese_length=4,
+    max_chinese_length=3,
     min_term_length=2,
     fuzzy_threshold=0.7,
     fuzzy_max_distance=2,
-    track_doc_terms=false,
+    track_doc_terms=true,
     drop_if_exists=false,
     lazy_load=false,
     cache_size=10000

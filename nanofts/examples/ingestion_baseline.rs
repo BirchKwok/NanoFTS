@@ -16,7 +16,7 @@ fn main() {
         println!("\n--- Testing with {} documents ---", size);
         
         // Generate test data
-        let doc_ids: Vec<u32> = (1..=size as u32).collect();
+        let doc_ids: Vec<u64> = (1..=size as u64).collect();
         let titles: Vec<String> = (0..size)
             .map(|i| format!("Document Title Number {} with some content", i))
             .collect();

@@ -61,21 +61,28 @@
 //! - `simd` - Enable SIMD acceleration (requires nightly)
 //! - `mimalloc` - Use mimalloc allocator (enabled by default)
 
-use mimalloc::MiMalloc;
-
+#[cfg(feature = "mimalloc")]
 #[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 // Core modules
+pub mod analyzer;
 pub mod bitmap;
+pub mod doc_tokens;
+pub mod fuzzy;
+pub mod persist;
+pub mod query;
 pub mod simd_utils;
 pub mod vbyte;
 pub mod wal;
+pub mod term_dir;
 pub mod lsm_single;
 pub mod unified_engine;
 
 // Re-export core types
+pub use analyzer::{AnalyzedDocument, AnalyzerConfig};
 pub use bitmap::{FastBitmap, BitmapError, fast_intersection, fast_union};
+pub use doc_tokens::{DocTokenStore, PackedDocTokens, RankedHit};
 pub use lsm_single::{LsmSingleIndex, LsmSingleError};
 pub use unified_engine::{
     UnifiedEngine,

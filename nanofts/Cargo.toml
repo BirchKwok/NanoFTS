@@ -1,6 +1,6 @@
 [package]
 name = "nanofts"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 authors = ["Birch Kwok"]
 description = "High-performance full-text search engine in Rust"
@@ -75,10 +75,11 @@ packed_simd_2 = { version = "0.3", optional = true }
 
 # 字符串处理
 unicode-segmentation = "1.11"
+unicode-normalization = "0.1"
 regex = "1.11"
 
-# 内存分配器
-mimalloc = { version = "0.1", default-features = false }
+# 内存分配器（可选，默认启用）
+mimalloc = { version = "0.1", default-features = false, optional = true }
 
 # 错误处理
 thiserror = "2.0"
@@ -108,7 +109,7 @@ default = ["mimalloc"]
 # Python bindings feature - enables PyO3 and numpy support
 python = ["pyo3", "numpy"]
 simd = ["packed_simd_2"]
-mimalloc = ["mimalloc/local_dynamic_tls"]
+mimalloc = ["dep:mimalloc", "mimalloc/local_dynamic_tls"]
 arrow = ["dep:arrow", "dep:arrow-array", "dep:arrow-buffer"]  # Arrow zero-copy support
 
 [profile.release]

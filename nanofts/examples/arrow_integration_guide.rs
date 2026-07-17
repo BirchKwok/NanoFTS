@@ -21,7 +21,7 @@ fn main() {
     let batch_size: usize = 50_000;
     
     // Simulate Arrow data (in real use, this comes from Arrow arrays)
-    let id_array: Vec<u32> = (1..=batch_size as u32).collect();
+    let id_array: Vec<u64> = (1..=batch_size as u64).collect();
     let title_array: Vec<String> = (0..batch_size)
         .map(|i| format!("Title {} with keywords", i))
         .collect();
@@ -193,7 +193,7 @@ fn main() {
     println!("  // Zero-copy columnar ingestion");
     println!("  pub fn add_documents_arrow_str<'a>(");
     println!("      &self,");
-    println!("      doc_ids: &[u32],");
+    println!("      doc_ids: &[u64],");
     println!("      columns: Vec<(String, Vec<&'a str>)>,  // Zero-copy views");
     println!("  ) -> EngineResult<usize>");
     println!();
@@ -201,7 +201,7 @@ fn main() {
     println!("  // Zero-copy single text column");
     println!("  pub fn add_documents_arrow_texts<'a>(");
     println!("      &self,");
-    println!("      doc_ids: &[u32],");
+    println!("      doc_ids: &[u64],");
     println!("      texts: &[&'a str],  // Zero-copy views");
     println!("  ) -> EngineResult<usize>");
     println!();

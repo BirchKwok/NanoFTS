@@ -17,6 +17,13 @@ A high-performance full-text search engine with Rust core, featuring efficient i
 - **LRU Cache**: Built-in caching for frequently accessed terms
 - **Data Import**: Import from pandas, polars, arrow, parquet, CSV, JSON
 
+### v0.8.0 Highlights
+
+- **NFS2 on-disk format** with **u64 document IDs** (IDs beyond 32-bit range are supported)
+- **BM25 ranking** via `search_ranked()` (requires `track_doc_terms=true`)
+- **Phrase queries** using quoted syntax, e.g. `"quick brown fox"`
+- **Legacy NFS1** indexes are not supported; opening them quarantines the file (`.incompatible` suffix) and requires a rebuild
+
 ## Installation
 
 ```bash
@@ -64,7 +71,7 @@ Add this to your project `Cargo.toml`:
 
 ```toml
 [dependencies]
-nanofts = "0.7.0"
+nanofts = "0.8.0"
 ```
 
 Optional features:

@@ -1,6 +1,6 @@
 //! Integration tests for NanoFTS
 
-use nanofts::{UnifiedEngine, EngineConfig, EngineResult, ResultHandle};
+use nanofts::{UnifiedEngine, EngineConfig};
 use std::collections::HashMap;
 
 /// Helper to create test documents
@@ -153,6 +153,85 @@ fn test_remove_multiple_documents() {
 }
 
 // ============================================
+// Base/Delta Shadow Semantics Tests (flush + update/delete)
+// ============================================
+
+#[test]
+fn test_update_after_flush_returns_new_content_not_old() {
+    let temp_dir = std::env::temp_dir();
+    let index_path = temp_dir.join("test_shadow_update_flush.nfts");
+    let _ = std::fs::remove_file(&index_path);
+    let _ = std::fs::remove_file(format!("{}.tok", index_path.to_str().unwrap()));
+    let _ = std::fs::remove_file(index_path.with_extension("nfts.wal"));
+
+    let config = EngineConfig::persistent(index_path.to_str().unwrap())
+        .with_drop_if_exists(true)
+        .with_track_doc_terms(true);
+    let engine = UnifiedEngine::new(config).unwrap();
+
+    // Add doc, then flush so its content lives in the base index.
+    engine.add_document(1, create_doc("Original Title", "Original content")).unwrap();
+    engine.flush().unwrap();
+
+    let result = engine.search("original").unwrap();
+    assert_eq!(result.total_hits(), 1);
+
+    // Update the same doc WITHOUT flushing: the base index still has the old
+    // "original" postings, but they must be shadowed so search only sees the
+    // fresh buffer content.
+    engine.update_document(1, create_doc("Updated Title", "New content")).unwrap();
+
+    let result = engine.search("updated").unwrap();
+    assert_eq!(result.total_hits(), 1, "search must return the new content after an unflushed update");
+    assert!(result.contains(1));
+
+    let result = engine.search("original").unwrap();
+    assert_eq!(result.total_hits(), 0, "stale base postings for the updated doc must be shadowed");
+
+    // Clean up
+    drop(engine);
+    let _ = std::fs::remove_file(&index_path);
+    let _ = std::fs::remove_file(format!("{}.tok", index_path.to_str().unwrap()));
+    let _ = std::fs::remove_file(index_path.with_extension("nfts.wal"));
+}
+
+#[test]
+fn test_delete_after_flush_excludes_from_search() {
+    let temp_dir = std::env::temp_dir();
+    let index_path = temp_dir.join("test_shadow_delete_flush.nfts");
+    let _ = std::fs::remove_file(&index_path);
+    let _ = std::fs::remove_file(format!("{}.tok", index_path.to_str().unwrap()));
+    let _ = std::fs::remove_file(index_path.with_extension("nfts.wal"));
+
+    let config = EngineConfig::persistent(index_path.to_str().unwrap())
+        .with_drop_if_exists(true)
+        .with_track_doc_terms(true);
+    let engine = UnifiedEngine::new(config).unwrap();
+
+    engine.add_document(1, create_doc("Test Doc", "Content here")).unwrap();
+    engine.add_document(2, create_doc("Another Doc", "More content")).unwrap();
+    engine.flush().unwrap();
+
+    let result = engine.search("test").unwrap();
+    assert_eq!(result.total_hits(), 1);
+
+    // Delete after flush: doc 1's postings are in the base index only now.
+    engine.remove_document(1).unwrap();
+
+    let result = engine.search("test").unwrap();
+    assert_eq!(result.total_hits(), 0, "deleted doc must be excluded from search even though its postings are in the base index");
+
+    let result = engine.search("another").unwrap();
+    assert_eq!(result.total_hits(), 1);
+
+    // Clean up
+    drop(engine);
+    let _ = std::fs::remove_file(&index_path);
+    let _ = std::fs::remove_file(format!("{}.tok", index_path.to_str().unwrap()));
+    let _ = std::fs::remove_file(index_path.with_extension("nfts.wal"));
+}
+
+// ============================================
 // Search Tests
 // ============================================
 
@@ -235,10 +314,17 @@ fn test_fuzzy_search() {
     let engine = UnifiedEngine::new(EngineConfig::memory_only()).unwrap();
     
     engine.add_document(1, create_doc("Programming", "Learn to program")).unwrap();
+    // Distractors that length/q-gram pruning should skip cheaply
+    for i in 2..200 {
+        engine
+            .add_document(i, create_doc("Noise", &format!("zzzzzzzz{i} unrelated filler text")))
+            .unwrap();
+    }
     
-    // Misspelled query
+    // Misspelled query — must still resolve via pruned Levenshtein candidates
     let result = engine.fuzzy_search("programing", 1).unwrap();
-    assert!(result.total_hits() >= 1 || result.is_fuzzy_used());
+    assert!(result.total_hits() >= 1);
+    assert!(result.contains(1));
 }
 
 // ============================================
@@ -492,7 +578,7 @@ fn test_large_batch_add() {
     let engine = UnifiedEngine::new(EngineConfig::memory_only()).unwrap();
     
     let docs: Vec<_> = (0..1000)
-        .map(|i| (i as u32, create_doc(&format!("Doc {}", i), &format!("Content {}", i))))
+        .map(|i| (i as u64, create_doc(&format!("Doc {}", i), &format!("Content {}", i))))
         .collect();
     
     let count = engine.add_documents(docs).unwrap();
@@ -534,5 +620,102 @@ fn test_cache_operations() {
     
     let stats = engine.stats();
     assert!(*stats.get("search_count").unwrap() >= 3.0);
+}
+
+// ============================================
+// v0.8.0 Feature Tests (u64, BM25, phrase, NFS2)
+// ============================================
+
+#[test]
+fn test_bm25_and_phrase_search() {
+    let mut config = EngineConfig::memory_only();
+    config.track_doc_terms = true;
+    let engine = UnifiedEngine::new(config).unwrap();
+
+    engine
+        .add_document(1, create_doc("Animals", "the quick brown fox jumps"))
+        .unwrap();
+    engine
+        .add_document(2, create_doc("Animals", "the quick fox brown jumps"))
+        .unwrap();
+    engine
+        .add_document(
+            3,
+            create_doc(
+                "Search",
+                "machine learning ranking search engine optimization",
+            ),
+        )
+        .unwrap();
+
+    // Phrase query: only doc 1 has consecutive "quick brown" tokens
+    let phrase_result = engine.search("\"quick brown\"").unwrap();
+    assert_eq!(phrase_result.total_hits(), 1);
+    assert!(phrase_result.contains(1));
+
+    // Plain AND query matches both docs with both terms
+    let plain = engine.search("quick brown").unwrap();
+    assert_eq!(plain.total_hits(), 2);
+
+    // BM25 ranking via search_ranked
+    let ranked = engine.search_ranked("search engine", 10).unwrap();
+    assert!(!ranked.is_empty());
+    assert!(ranked.iter().all(|hit| hit.score > 0.0));
+    assert_eq!(ranked[0].doc_id, 3);
+}
+
+#[test]
+fn test_u64_doc_ids() {
+    let engine = UnifiedEngine::new(EngineConfig::memory_only()).unwrap();
+
+    let large_id: u64 = 5_000_000_000; // > u32::MAX
+    engine
+        .add_document(
+            large_id,
+            create_doc("Large ID Doc", "unique u64 document identifier"),
+        )
+        .unwrap();
+
+    let result = engine.search("unique").unwrap();
+    assert_eq!(result.total_hits(), 1);
+    assert!(result.contains(large_id));
+    assert_eq!(result.to_list()[0], large_id);
+}
+
+#[test]
+fn test_legacy_nfs1_rejected() {
+    let temp_dir = std::env::temp_dir();
+    let index_path = temp_dir.join("test_legacy_nfs1.nfts");
+    let quarantine_path = {
+        let mut p = index_path.clone().into_os_string();
+        p.push(".incompatible");
+        std::path::PathBuf::from(p)
+    };
+
+    let _ = std::fs::remove_file(&index_path);
+    let _ = std::fs::remove_file(&quarantine_path);
+
+    // Write a minimal fake NFS1 header (64 bytes)
+    let mut header = [0u8; 64];
+    header[0..4].copy_from_slice(b"NFS1");
+    std::fs::write(&index_path, &header).unwrap();
+
+    let config = EngineConfig::persistent(index_path.to_str().unwrap());
+    let result = UnifiedEngine::new(config);
+
+    assert!(result.is_err());
+    let err_msg = result.err().unwrap().to_string();
+    assert!(
+        err_msg.contains("NFS1") || err_msg.contains("Legacy"),
+        "unexpected error: {err_msg}"
+    );
+    assert!(!index_path.exists(), "original NFS1 file should be quarantined");
+    assert!(
+        quarantine_path.exists(),
+        "quarantined file should exist at {:?}",
+        quarantine_path
+    );
+
+    let _ = std::fs::remove_file(&quarantine_path);
 }
 

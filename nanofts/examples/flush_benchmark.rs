@@ -12,8 +12,8 @@
 
 use nanofts::{EngineConfig, UnifiedEngine};
 
-fn generate_data(n: usize) -> (Vec<u32>, Vec<String>) {
-    let doc_ids: Vec<u32> = (1..=n as u32).collect();
+fn generate_data(n: usize) -> (Vec<u64>, Vec<String>) {
+    let doc_ids: Vec<u64> = (1..=n as u64).collect();
     let texts: Vec<String> = (0..n)
         .map(|i| {
             format!(

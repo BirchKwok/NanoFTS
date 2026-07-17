@@ -27,6 +27,7 @@
 //! - LRU cache manages memory
 
 use crate::bitmap::FastBitmap;
+use crate::term_dir::TermDirectory;
 use crate::vbyte;
 use crate::wal::{WriteAheadLog, WalOp};
 use dashmap::DashMap;
@@ -41,11 +42,17 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use thiserror::Error;
 
-const MAGIC: &[u8; 4] = b"NFS1"; // NanoFTS Single v1
-const VERSION: u16 = 1;
+const MAGIC: &[u8; 4] = b"NFS2"; // NanoFTS Single v2 (u64 doc ids)
+const LEGACY_MAGIC: &[u8; 4] = b"NFS1"; // NanoFTS Single v1 (u32 doc ids, unsupported)
+const VERSION: u16 = 2;
+const ANALYZER_VERSION: u32 = 2;
 const HEADER_SIZE: usize = 64;
 const ROARING_THRESHOLD: usize = 128;
 const DEFAULT_CACHE_SIZE: usize = 10000; // Default cache 10000 terms
+/// Uncompressed posting codecs (before zstd).
+const POSTING_CODEC_VBYTE: u8 = 0;
+const POSTING_CODEC_SINGLE: u8 = 1;
+const POSTING_CODEC_ROARING: u8 = 2;
 
 #[derive(Error, Debug)]
 pub enum LsmSingleError {
@@ -55,10 +62,11 @@ pub enum LsmSingleError {
     InvalidFormat(String),
     #[error("Compression error: {0}")]
     CompressionError(String),
+    #[error("Checksum mismatch")]
+    ChecksumMismatch,
 }
 
-/// File header
-#[repr(C)]
+/// File header (on-disk layout is little-endian; see encode/decode)
 #[derive(Clone, Copy, Debug)]
 struct FileHeader {
     magic: [u8; 4],
@@ -68,6 +76,103 @@ struct FileHeader {
     total_terms: u64,
     total_docs: u64,
     _reserved: [u8; 32],
+}
+
+fn encode_posting(bitmap: &FastBitmap) -> Result<Vec<u8>, LsmSingleError> {
+    let mut serialized = Vec::new();
+    if bitmap.len() == 1 {
+        serialized.push(POSTING_CODEC_SINGLE);
+        let id = bitmap.iter().next().unwrap();
+        serialized.extend_from_slice(&id.to_le_bytes());
+    } else if bitmap.len() < ROARING_THRESHOLD as u64 {
+        serialized.push(POSTING_CODEC_VBYTE);
+        let ids: Vec<u64> = bitmap.to_vec();
+        vbyte::encode_sorted_u64_array(&ids, &mut serialized);
+    } else {
+        serialized.push(POSTING_CODEC_ROARING);
+        let roaring = bitmap
+            .serialize()
+            .map_err(|e| LsmSingleError::CompressionError(e.to_string()))?;
+        serialized.extend_from_slice(&roaring);
+    }
+    zstd::encode_all(&serialized[..], 1).map_err(|e| LsmSingleError::CompressionError(e.to_string()))
+}
+
+fn decode_posting(compressed: &[u8]) -> Option<FastBitmap> {
+    let decompressed = zstd::decode_all(compressed).ok()?;
+    if decompressed.is_empty() {
+        return None;
+    }
+    // NFS2 codec-prefixed payloads
+    match decompressed[0] {
+        POSTING_CODEC_SINGLE if decompressed.len() == 9 => {
+            let id = u64::from_le_bytes(decompressed[1..9].try_into().ok()?);
+            Some(FastBitmap::from_iter([id]))
+        }
+        POSTING_CODEC_VBYTE => {
+            let (ids, _) = vbyte::decode_sorted_u64_array(&decompressed[1..])?;
+            Some(FastBitmap::from_iter(ids))
+        }
+        POSTING_CODEC_ROARING => FastBitmap::deserialize(&decompressed[1..]).ok(),
+        // Legacy unprefixed payloads (same process, pre-codec): try roaring then vbyte
+        _ => {
+            if let Ok(b) = FastBitmap::deserialize(&decompressed) {
+                Some(b)
+            } else if let Some((ids, _)) = vbyte::decode_sorted_u64_array(&decompressed) {
+                Some(FastBitmap::from_iter(ids))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+impl FileHeader {
+    /// Encode to a portable little-endian 64-byte buffer.
+    fn to_bytes(&self) -> [u8; HEADER_SIZE] {
+        let mut buf = [0u8; HEADER_SIZE];
+        buf[0..4].copy_from_slice(&self.magic);
+        buf[4..6].copy_from_slice(&self.version.to_le_bytes());
+        buf[6..8].copy_from_slice(&self.flags.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.block_count.to_le_bytes());
+        buf[16..24].copy_from_slice(&self.total_terms.to_le_bytes());
+        buf[24..32].copy_from_slice(&self.total_docs.to_le_bytes());
+        buf[32..64].copy_from_slice(&self._reserved);
+        buf
+    }
+
+    /// Store the analyzer version as u32 LE in the first 4 bytes of `_reserved`.
+    fn set_analyzer_version(&mut self, analyzer_version: u32) {
+        self._reserved[0..4].copy_from_slice(&analyzer_version.to_le_bytes());
+    }
+
+    /// Read the analyzer version stored in the first 4 bytes of `_reserved`.
+    #[allow(dead_code)]
+    fn analyzer_version(&self) -> u32 {
+        u32::from_le_bytes(self._reserved[0..4].try_into().unwrap())
+    }
+
+    /// Store CRC32 of payload (bytes after header) in reserved[20..24].
+    fn set_payload_crc(&mut self, crc: u32) {
+        self._reserved[20..24].copy_from_slice(&crc.to_le_bytes());
+    }
+
+    fn payload_crc(&self) -> u32 {
+        u32::from_le_bytes(self._reserved[20..24].try_into().unwrap())
+    }
+
+    /// Decode from a portable little-endian 64-byte buffer.
+    fn from_bytes(buf: &[u8; HEADER_SIZE]) -> Self {
+        Self {
+            magic: buf[0..4].try_into().unwrap(),
+            version: u16::from_le_bytes(buf[4..6].try_into().unwrap()),
+            flags: u16::from_le_bytes(buf[6..8].try_into().unwrap()),
+            block_count: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+            total_terms: u64::from_le_bytes(buf[16..24].try_into().unwrap()),
+            total_docs: u64::from_le_bytes(buf[24..32].try_into().unwrap()),
+            _reserved: buf[32..64].try_into().unwrap(),
+        }
+    }
 }
 
 /// Term index entry (for lazy load mode)
@@ -94,6 +199,13 @@ pub struct LsmSingleIndex {
     data: DashMap<String, FastBitmap>,
     /// Term index directory (lazy load mode)
     term_index: RwLock<FxHashMap<String, TermIndexEntry>>,
+    /// Sorted, mmap-friendly term directory sidecar (lazy load fast path).
+    /// Built by `compact_with_deletions` from the fully-compacted live postings;
+    /// checked before falling back to `term_index` in `get_lazy`.
+    term_dir: RwLock<Option<TermDirectory>>,
+    /// Set when a persisted `.tdir` sidecar exists but could not be loaded
+    /// (missing/corrupt/stale). A `compact()` call rebuilds it.
+    needs_rebuild: AtomicBool,
     /// LRU cache (lazy load mode)
     cache: Mutex<LruCache<String, FastBitmap>>,
     /// Cache hit statistics
@@ -140,7 +252,7 @@ impl LsmSingleIndex {
             .truncate(true)
             .open(&path)?;
         
-        let header = FileHeader {
+        let mut header = FileHeader {
             magic: *MAGIC,
             version: VERSION,
             flags: 0,
@@ -149,6 +261,7 @@ impl LsmSingleIndex {
             total_docs: 0,
             _reserved: [0; 32],
         };
+        header.set_analyzer_version(ANALYZER_VERSION);
         
         Self::write_header(&mut file, &header)?;
         file.flush()?;
@@ -174,6 +287,8 @@ impl LsmSingleIndex {
             header: RwLock::new(header),
             data: DashMap::new(),
             term_index: RwLock::new(FxHashMap::default()),
+            term_dir: RwLock::new(None),
+            needs_rebuild: AtomicBool::new(false),
             cache: Mutex::new(LruCache::new(cache_cap)),
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
@@ -223,8 +338,38 @@ impl LsmSingleIndex {
         
         let header = Self::read_header(&mut file)?;
         
+        if &header.magic == LEGACY_MAGIC {
+            drop(file);
+            let quarantine_path = {
+                let mut p = path.clone().into_os_string();
+                p.push(".incompatible");
+                PathBuf::from(p)
+            };
+            let _ = std::fs::rename(&path, &quarantine_path);
+            return Err(LsmSingleError::InvalidFormat(
+                "Legacy NFS1 format is not supported; rebuild the index".into(),
+            ));
+        }
+        
         if &header.magic != MAGIC {
             return Err(LsmSingleError::InvalidFormat("Invalid magic".into()));
+        }
+
+        // Verify payload CRC when present (skip in lazy_load for fast open of huge files).
+        if !lazy_load && header.payload_crc() != 0 {
+            match Self::compute_payload_crc(&mut file) {
+                Ok(crc) if crc == header.payload_crc() => {}
+                Ok(_) | Err(_) => {
+                    drop(file);
+                    let quarantine_path = {
+                        let mut p = path.clone().into_os_string();
+                        p.push(".incompatible");
+                        PathBuf::from(p)
+                    };
+                    let _ = std::fs::rename(&path, &quarantine_path);
+                    return Err(LsmSingleError::ChecksumMismatch);
+                }
+            }
         }
         
         let cache_cap = NonZeroUsize::new(cache_size.max(1)).unwrap();
@@ -238,6 +383,26 @@ impl LsmSingleIndex {
             // Full load mode: load all data
             let data = Self::load_all_blocks(&mut file, &header)?;
             (data, FxHashMap::default())
+        };
+        
+        // Opportunistically load the sorted mmap term directory sidecar (lazy load
+        // fast path only). Missing sidecar is normal (never compacted yet with this
+        // feature); an existing-but-unreadable sidecar just falls back to `term_index`
+        // and flags `needs_rebuild` so callers can decide to `compact()`.
+        let (term_dir_loaded, tdir_needs_rebuild) = if lazy_load {
+            match Self::load_term_dir_sidecar(&path) {
+                Ok(Some(dir)) => (Some(dir), false),
+                Ok(None) => (None, false),
+                Err(e) => {
+                    eprintln!(
+                        "Term directory sidecar for {:?} is invalid ({e}); falling back to full index scan; run compact() to rebuild it",
+                        path
+                    );
+                    (None, true)
+                }
+            }
+        } else {
+            (None, false)
         };
         
         let mut data_map = data_map;
@@ -290,6 +455,8 @@ impl LsmSingleIndex {
             header: RwLock::new(header),
             data,
             term_index: RwLock::new(term_index),
+            term_dir: RwLock::new(term_dir_loaded),
+            needs_rebuild: AtomicBool::new(tdir_needs_rebuild),
             cache: Mutex::new(LruCache::new(cache_cap)),
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
@@ -306,10 +473,7 @@ impl LsmSingleIndex {
     
     fn write_header(file: &mut File, header: &FileHeader) -> Result<(), LsmSingleError> {
         file.seek(SeekFrom::Start(0))?;
-        let bytes = unsafe {
-            std::slice::from_raw_parts(header as *const FileHeader as *const u8, HEADER_SIZE)
-        };
-        file.write_all(bytes)?;
+        file.write_all(&header.to_bytes())?;
         Ok(())
     }
     
@@ -317,8 +481,85 @@ impl LsmSingleIndex {
         file.seek(SeekFrom::Start(0))?;
         let mut bytes = [0u8; HEADER_SIZE];
         file.read_exact(&mut bytes)?;
-        let header: FileHeader = unsafe { std::ptr::read(bytes.as_ptr() as *const FileHeader) };
-        Ok(header)
+        Ok(FileHeader::from_bytes(&bytes))
+    }
+
+    /// Path of the sorted term directory sidecar next to the main index file.
+    fn tdir_path_for(path: &Path) -> PathBuf {
+        let mut p = path.as_os_str().to_os_string();
+        p.push(".tdir");
+        PathBuf::from(p)
+    }
+
+    fn tdir_path(&self) -> PathBuf {
+        Self::tdir_path_for(&self.path)
+    }
+
+    /// Load the `.tdir` sidecar next to `path`, if present.
+    /// `Ok(None)` means no sidecar exists yet (not an error); `Err` means a
+    /// sidecar exists but failed to parse (corrupt/stale format).
+    fn load_term_dir_sidecar(path: &Path) -> Result<Option<TermDirectory>, std::io::Error> {
+        let tdir_path = Self::tdir_path_for(path);
+        if !tdir_path.exists() {
+            return Ok(None);
+        }
+        TermDirectory::open(&tdir_path).map(Some)
+    }
+
+    /// (Re)build the sorted term directory sidecar from the fully-compacted
+    /// live postings and load it as the new lazy-load fast path.
+    /// On any failure, leaves `term_dir` cleared and sets `needs_rebuild`.
+    fn write_term_dir_sidecar(&self, live_entries: &[(String, FastBitmap)]) {
+        let build = || -> Result<TermDirectory, LsmSingleError> {
+            let mut sorted: Vec<(String, Vec<u8>)> = Vec::with_capacity(live_entries.len());
+            for (term, bitmap) in live_entries {
+                let compressed = encode_posting(bitmap)?;
+                sorted.push((term.clone(), compressed));
+            }
+            sorted.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+            crate::term_dir::write_term_dir(self.tdir_path(), &sorted)?;
+            TermDirectory::open(self.tdir_path()).map_err(LsmSingleError::IoError)
+        };
+
+        match build() {
+            Ok(dir) => {
+                *self.term_dir.write() = Some(dir);
+                self.needs_rebuild.store(false, Ordering::SeqCst);
+            }
+            Err(e) => {
+                eprintln!("Failed to (re)build term directory sidecar: {e}");
+                *self.term_dir.write() = None;
+                self.needs_rebuild.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// Fast-path lookup against the sorted mmap term directory, if loaded.
+    fn get_from_term_dir(&self, term: &str) -> Option<FastBitmap> {
+        let guard = self.term_dir.read();
+        let dir = guard.as_ref()?;
+        let compressed = dir.get(term)?;
+        decode_posting(compressed)
+    }
+
+    /// CRC32 over all bytes after the 64-byte header.
+    fn compute_payload_crc(file: &mut File) -> Result<u32, LsmSingleError> {
+        use crc32fast::Hasher;
+        let len = file.metadata()?.len();
+        if len <= HEADER_SIZE as u64 {
+            return Ok(0);
+        }
+        file.seek(SeekFrom::Start(HEADER_SIZE as u64))?;
+        let mut hasher = Hasher::new();
+        let mut buf = [0u8; 64 * 1024];
+        let mut remaining = (len - HEADER_SIZE as u64) as usize;
+        while remaining > 0 {
+            let n = remaining.min(buf.len());
+            file.read_exact(&mut buf[..n])?;
+            hasher.update(&buf[..n]);
+            remaining -= n;
+        }
+        Ok(hasher.finalize())
     }
     
     fn load_all_blocks(file: &mut File, header: &FileHeader) -> Result<FxHashMap<String, FastBitmap>, LsmSingleError> {
@@ -474,18 +715,7 @@ impl LsmSingleIndex {
             let compressed = &data[offset..offset+data_len];
             offset += data_len;
             
-            // Decompress
-            if let Ok(decompressed) = zstd::decode_all(compressed) {
-                // Decode bitmap
-                let bitmap = if let Ok(b) = FastBitmap::deserialize(&decompressed) {
-                    b
-                } else if let Some((ids, _)) = vbyte::decode_sorted_u32_array(&decompressed) {
-                    FastBitmap::from_iter(ids)
-                } else {
-                    continue;
-                };
-                
-                // Merge into result
+            if let Some(bitmap) = decode_posting(compressed) {
                 result.entry(term)
                     .and_modify(|existing| existing.or_inplace(&bitmap))
                     .or_insert(bitmap);
@@ -513,19 +743,9 @@ impl LsmSingleIndex {
                 continue;
             }
             
-            // Decompress
-            let decompressed = match zstd::decode_all(&compressed[..]) {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
-            
-            // Decode bitmap
-            let bitmap = if let Ok(b) = FastBitmap::deserialize(&decompressed) {
-                b
-            } else if let Some((ids, _)) = vbyte::decode_sorted_u32_array(&decompressed) {
-                FastBitmap::from_iter(ids)
-            } else {
-                continue;
+            let bitmap = match decode_posting(&compressed) {
+                Some(b) => b,
+                None => continue,
             };
             
             // Merge into result
@@ -543,7 +763,7 @@ impl LsmSingleIndex {
     pub fn upsert(&self, term: &str, doc_id: u64) {
         // Write to WAL first (if enabled)
         if let Some(ref wal) = self.wal {
-            wal.log_add(term, doc_id as u32);
+            wal.log_add(term, doc_id);
         }
         
         let mut buffer = self.buffer.write();
@@ -551,7 +771,7 @@ impl LsmSingleIndex {
         
         buffer.entry(term.to_string())
             .or_insert_with(FastBitmap::new)
-            .add(doc_id as u32);
+            .add(doc_id);
         
         drop(buffer);
         
@@ -574,7 +794,7 @@ impl LsmSingleIndex {
         // Batch write to WAL (if enabled) — collect all (term, doc_id) pairs
         // and submit in one lock acquisition instead of per-pair locking
         if let Some(ref wal) = self.wal {
-            let mut wal_entries: Vec<(String, u32)> = Vec::new();
+            let mut wal_entries: Vec<(String, u64)> = Vec::new();
             for (term, bitmap) in &entries {
                 for doc_id in bitmap.iter() {
                     wal_entries.push((term.clone(), doc_id));
@@ -707,22 +927,25 @@ impl LsmSingleIndex {
             }
         }
         
-        // 2. Cache miss, look up in index directory
+        self.cache_misses.fetch_add(1, Ordering::Relaxed);
+        
+        // 2. Fast path: sorted mmap term directory built at the last compact.
+        // Binary search directly on the mapped file, no per-term String
+        // allocation or full-index scan required.
+        if let Some(bitmap) = self.get_from_term_dir(term) {
+            let mut cache = self.cache.lock();
+            cache.put(term.to_string(), bitmap.clone());
+            return Some(bitmap);
+        }
+        
+        // 3. Fallback: legacy HashMap directory. Covers terms written since the
+        // last compact (not yet reflected in the directory sidecar) and indexes
+        // that don't have a sidecar at all.
         let entry = {
             let index = self.term_index.read();
             index.get(term).cloned()
         };
-        
-        let entry = match entry {
-            Some(e) => e,
-            None => {
-                self.cache_misses.fetch_add(1, Ordering::Relaxed);
-                return None;
-            }
-        };
-        
-        // 3. Load from file
-        self.cache_misses.fetch_add(1, Ordering::Relaxed);
+        let entry = entry?;
         let bitmap = self.load_term_from_file(&entry)?;
         
         // 4. Put into cache
@@ -764,6 +987,19 @@ impl LsmSingleIndex {
     /// Whether lazy load is enabled
     pub fn is_lazy_load(&self) -> bool {
         self.lazy_load
+    }
+    
+    /// True when the persisted term directory sidecar (`.tdir`) is missing,
+    /// stale, or corrupt and a `compact()` call is recommended to rebuild it
+    /// and restore the lazy-load mmap fast path.
+    pub fn needs_rebuild(&self) -> bool {
+        self.needs_rebuild.load(Ordering::Relaxed)
+    }
+    
+    /// True if the sorted mmap term directory (lazy-load fast path) is
+    /// currently loaded and being consulted by `get()`.
+    pub fn term_dir_loaded(&self) -> bool {
+        self.term_dir.read().is_some()
     }
     
     /// Warmup cache (load specified terms)
@@ -826,16 +1062,7 @@ impl LsmSingleIndex {
                         let mut results = Vec::with_capacity(end - start);
                         for i in start..end {
                             let (_, bitmap) = &entries_ref[i];
-                            let serialized = if bitmap.len() < ROARING_THRESHOLD as u64 {
-                                let ids: Vec<u32> = bitmap.to_vec();
-                                let mut buf = Vec::new();
-                                vbyte::encode_sorted_u32_array(&ids, &mut buf);
-                                buf
-                            } else {
-                                bitmap.serialize().unwrap_or_default()
-                            };
-                            let res = zstd::encode_all(&serialized[..], 1)
-                                .map_err(|e| e.to_string());
+                            let res = encode_posting(bitmap).map_err(|e| e.to_string());
                             results.push((i, res));
                         }
                         results
@@ -854,15 +1081,7 @@ impl LsmSingleIndex {
         } else {
             // Sequential path for small batches
             entries.iter().map(|(_, bitmap)| {
-                let serialized = if bitmap.len() < ROARING_THRESHOLD as u64 {
-                    let ids: Vec<u32> = bitmap.to_vec();
-                    let mut buf = Vec::new();
-                    vbyte::encode_sorted_u32_array(&ids, &mut buf);
-                    buf
-                } else {
-                    bitmap.serialize().unwrap_or_default()
-                };
-                zstd::encode_all(&serialized[..], 1).map_err(|e| e.to_string())
+                encode_posting(bitmap).map_err(|e| e.to_string())
             }).collect()
         };
 
@@ -896,12 +1115,15 @@ impl LsmSingleIndex {
         header.block_count += 1;
         header.total_terms += entries.len() as u64;
         header.total_docs += entries.iter().map(|(_, b)| b.len()).sum::<u64>();
+        let crc = Self::compute_payload_crc(&mut file)?;
+        header.set_payload_crc(crc);
         
         Self::write_header(&mut file, &header)?;
-        file.sync_all()?; // Ensure data is written to disk
-        
+        file.sync_all()?; // Ensure data + metadata are on disk
         drop(header);
         drop(file);
+        // Durably record the directory entry for newly-created index files as well.
+        crate::persist::sync_parent_dir(&self.path)?;
         
         // Update in-memory index structures based on mode (full-load already done above)
         if self.lazy_load {
@@ -954,7 +1176,7 @@ impl LsmSingleIndex {
     }
     
     /// Compact and apply deletions
-    pub fn compact_with_deletions(&self, deleted_docs: &[u32]) -> Result<(), LsmSingleError> {
+    pub fn compact_with_deletions(&self, deleted_docs: &[u64]) -> Result<(), LsmSingleError> {
         // Set compacting flag to block other flush operations
         self.compacting.store(true, Ordering::SeqCst);
         
@@ -972,6 +1194,11 @@ impl LsmSingleIndex {
         // Create temp file
         let tmp_path = self.path.with_extension("nfts.tmp");
         
+        // Snapshot of the fully-compacted live postings, used below to (re)build the
+        // sorted mmap term directory sidecar for lazy-load mode. Only collected in
+        // lazy_load mode since that's the only mode that consults the sidecar.
+        let mut live_entries: Vec<(String, FastBitmap)> = Vec::new();
+        
         {
             // Disable WAL for temp index as this is atomic operation, no recovery needed
             let new_index = Self::create_with_options(&tmp_path, false)?;
@@ -980,6 +1207,7 @@ impl LsmSingleIndex {
             if self.lazy_load {
                 // Lazy load mode: need to get data from index directory and cache
                 let term_index = self.term_index.read();
+                live_entries.reserve(term_index.len());
                 for (term, entry) in term_index.iter() {
                     // Load bitmap
                     if let Some(mut bitmap) = self.load_term_from_file(entry) {
@@ -990,7 +1218,8 @@ impl LsmSingleIndex {
                         
                         // Only write non-empty bitmaps
                         if !bitmap.is_empty() {
-                            new_index.buffer.write().insert(term.clone(), bitmap);
+                            new_index.buffer.write().insert(term.clone(), bitmap.clone());
+                            live_entries.push((term.clone(), bitmap));
                         }
                     }
                 }
@@ -1011,13 +1240,19 @@ impl LsmSingleIndex {
                 }
             }
             new_index.flush()?;
+            // `flush` already sync_all'd the temp index file. Drop the handle so
+            // rename can replace it on all platforms (notably Windows).
         }
         
-        // Replace file
-        std::fs::rename(&tmp_path, &self.path)?;
+        // Atomic replace + parent-dir fsync so the new index inode is durable.
+        crate::persist::durable_rename(&tmp_path, &self.path)?;
         
         // Clean up potentially remaining temp WAL file
-        let tmp_wal_path = tmp_path.with_extension("nfts.wal");
+        let tmp_wal_path = {
+            let mut p = tmp_path.clone().into_os_string();
+            p.push(".wal");
+            PathBuf::from(p)
+        };
         if tmp_wal_path.exists() {
             let _ = std::fs::remove_file(&tmp_wal_path);
         }
@@ -1040,6 +1275,10 @@ impl LsmSingleIndex {
             let new_index = Self::load_term_index(&mut file, &new_header)?;
             *self.term_index.write() = new_index;
             self.clear_cache();
+            // Rebuild the sorted mmap term directory sidecar from the compacted live
+            // postings so lazy-load lookups can use the fast binary-search path again.
+            // Sidecar write itself is durable (tmp + sync + parent fsync).
+            self.write_term_dir_sidecar(&live_entries);
         } else {
             let new_data = Self::load_all_blocks(&mut file, &new_header)?;
             self.data.clear();
@@ -1106,7 +1345,7 @@ impl LsmSingleIndex {
     }
     
     /// Remove specified document IDs from all data
-    pub fn remove_docs(&self, doc_ids: &[u32]) {
+    pub fn remove_docs(&self, doc_ids: &[u64]) {
         // Remove from buffer
         for entry in self.buffer.write().values_mut() {
             for &doc_id in doc_ids {
@@ -1126,5 +1365,163 @@ impl LsmSingleIndex {
 impl Drop for LsmSingleIndex {
     fn drop(&mut self) {
         let _ = self.flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_file_header_roundtrip_le_layout() {
+        let header = FileHeader {
+            magic: *MAGIC,
+            version: VERSION,
+            flags: 0xAABB,
+            block_count: 0x1122334455667788,
+            total_terms: 0x99AABBCCDDEEFF00,
+            total_docs: 0x0102030405060708,
+            _reserved: [0x5A; 32],
+        };
+
+        let bytes = header.to_bytes();
+        assert_eq!(bytes.len(), HEADER_SIZE);
+        assert_eq!(&bytes[0..4], MAGIC);
+        assert_eq!(MAGIC, b"NFS2");
+        assert_eq!(LEGACY_MAGIC, b"NFS1");
+        assert_eq!(&bytes[4..6], &VERSION.to_le_bytes());
+        assert_eq!(&bytes[6..8], &0xAABBu16.to_le_bytes());
+        assert_eq!(&bytes[8..16], &0x1122334455667788u64.to_le_bytes());
+        assert_eq!(&bytes[16..24], &0x99AABBCCDDEEFF00u64.to_le_bytes());
+        assert_eq!(&bytes[24..32], &0x0102030405060708u64.to_le_bytes());
+        assert_eq!(&bytes[32..64], &[0x5Au8; 32]);
+
+        let decoded = FileHeader::from_bytes(&bytes);
+        assert_eq!(decoded.magic, header.magic);
+        assert_eq!(decoded.version, header.version);
+        assert_eq!(decoded.flags, header.flags);
+        assert_eq!(decoded.block_count, header.block_count);
+        assert_eq!(decoded.total_terms, header.total_terms);
+        assert_eq!(decoded.total_docs, header.total_docs);
+        assert_eq!(decoded._reserved, header._reserved);
+    }
+
+    #[test]
+    fn test_analyzer_version_roundtrip() {
+        let mut header = FileHeader {
+            magic: *MAGIC,
+            version: VERSION,
+            flags: 0,
+            block_count: 0,
+            total_terms: 0,
+            total_docs: 0,
+            _reserved: [0; 32],
+        };
+        header.set_analyzer_version(ANALYZER_VERSION);
+
+        let bytes = header.to_bytes();
+        assert_eq!(&bytes[32..36], &ANALYZER_VERSION.to_le_bytes());
+
+        let decoded = FileHeader::from_bytes(&bytes);
+        assert_eq!(decoded.analyzer_version(), ANALYZER_VERSION);
+    }
+
+    #[test]
+    fn test_posting_single_doc_codec() {
+        let bitmap = FastBitmap::from_iter([u32::MAX as u64 + 9]);
+        let compressed = encode_posting(&bitmap).unwrap();
+        let decoded = decode_posting(&compressed).unwrap();
+        assert_eq!(decoded.to_vec(), vec![u32::MAX as u64 + 9]);
+    }
+
+    #[test]
+    fn test_posting_vbyte_and_roaring_codecs() {
+        let small = FastBitmap::from_iter([1u64, 2, 5, 10]);
+        let decoded_small = decode_posting(&encode_posting(&small).unwrap()).unwrap();
+        assert_eq!(decoded_small.len(), 4);
+
+        let large_ids: Vec<u64> = (0..200).collect();
+        let large = FastBitmap::from_iter(large_ids);
+        let decoded_large = decode_posting(&encode_posting(&large).unwrap()).unwrap();
+        assert_eq!(decoded_large.len(), 200);
+    }
+
+    #[test]
+    fn test_payload_crc_roundtrip_on_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crc.nfts");
+        {
+            let index = LsmSingleIndex::create_with_options(&path, false).unwrap();
+            index.upsert("hello", 1);
+            index.upsert("world", 2);
+            index.flush().unwrap();
+        }
+        // Reopen should verify CRC successfully
+        let index = LsmSingleIndex::open_with_options(&path, false).unwrap();
+        assert!(index.get("hello").unwrap().contains(1));
+    }
+
+    #[test]
+    fn test_compact_then_reopen_lazy_uses_term_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lazy_tdir.nfts");
+
+        // Build up an index with a handful of terms/docs, then compact so the
+        // sorted mmap term directory sidecar gets written.
+        {
+            let index = LsmSingleIndex::create_full_options(&path, false, true, 1000).unwrap();
+            index.upsert("hello", 1);
+            index.upsert("world", 2);
+            index.upsert("hello", 3);
+            index.upsert("rust", 4);
+            index.flush().unwrap();
+            index.compact().unwrap();
+
+            // The sidecar should be built and loaded immediately after compact.
+            assert!(index.term_dir_loaded(), "term directory should be loaded right after compact");
+            assert!(!index.needs_rebuild());
+        }
+
+        // Reopen fresh (simulating a process restart) in lazy mode and verify the
+        // sidecar is picked back up and lookups go through it correctly.
+        let reopened = LsmSingleIndex::open_full_options(&path, false, true, 1000).unwrap();
+        assert!(reopened.term_dir_loaded(), "term directory should load on reopen");
+        assert!(!reopened.needs_rebuild());
+
+        let hello = reopened.get("hello").unwrap();
+        assert!(hello.contains(1));
+        assert!(hello.contains(3));
+        assert_eq!(hello.len(), 2);
+
+        let world = reopened.get("world").unwrap();
+        assert!(world.contains(2));
+
+        let rust = reopened.get("rust").unwrap();
+        assert!(rust.contains(4));
+
+        assert!(reopened.get("missing-term").is_none());
+
+        // Cache should have been populated via the directory fast path.
+        let (_, misses, cache_len) = reopened.cache_stats();
+        assert!(misses >= 3);
+        assert!(cache_len >= 3);
+    }
+
+    #[test]
+    fn test_open_lazy_without_sidecar_falls_back_gracefully() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lazy_no_tdir.nfts");
+
+        {
+            let index = LsmSingleIndex::create_full_options(&path, false, true, 1000).unwrap();
+            index.upsert("alpha", 1);
+            index.flush().unwrap();
+            // No compact() call here, so no sidecar is ever written.
+        }
+
+        let reopened = LsmSingleIndex::open_full_options(&path, false, true, 1000).unwrap();
+        assert!(!reopened.term_dir_loaded(), "no sidecar should be present without a compact");
+        assert!(!reopened.needs_rebuild(), "missing sidecar is not an error condition");
+        assert!(reopened.get("alpha").unwrap().contains(1));
     }
 }
