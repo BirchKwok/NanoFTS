@@ -1,16 +1,10 @@
-//! Head-to-head microbenchmark for ingest + search + fuzzy + flush.
-//! Build with `--cfg doc_id_u64` for NanoFTS 0.8+; omit for 0.7 (u32 doc ids).
+//! Head-to-head microbenchmark for ingest + search + fuzzy + flush (NanoFTS 0.8+, u64 doc ids).
 
 use nanofts::{EngineConfig, UnifiedEngine};
 use std::time::Instant;
 
-#[cfg(doc_id_u64)]
-type DocId = u64;
-#[cfg(not(doc_id_u64))]
-type DocId = u32;
-
-fn make_docs(n: usize) -> (Vec<DocId>, Vec<String>) {
-    let ids: Vec<DocId> = (1..=n as DocId).collect();
+fn make_docs(n: usize) -> (Vec<u64>, Vec<String>) {
+    let ids: Vec<u64> = (1..=n as u64).collect();
     let texts: Vec<String> = (0..n)
         .map(|i| {
             format!(
@@ -115,10 +109,7 @@ fn bench_flush(n: usize) -> f64 {
 
 fn main() {
     println!("=== NanoFTS Benchmark ===");
-    #[cfg(doc_id_u64)]
     println!("doc_id: u64 (0.8+)");
-    #[cfg(not(doc_id_u64))]
-    println!("doc_id: u32 (0.7)");
     println!();
 
     for &n in &[10_000usize, 50_000] {
