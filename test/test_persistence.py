@@ -61,8 +61,8 @@ class TestIndexFileBasics:
         with open(tmp_index_file, 'rb') as f:
             magic = f.read(4)
         
-        # NanoFTS Single 的 magic 是 "NFS1"
-        assert magic == b'NFS1'
+        # NanoFTS Single 0.8+ magic is "NFS2"
+        assert magic == b'NFS2'
 
 
 class TestMultipleOpenClose:

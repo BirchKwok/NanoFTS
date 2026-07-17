@@ -1207,8 +1207,33 @@ impl UnifiedEngine {
             let count = entries.len();
             
             if !entries.is_empty() {
+                // Updated docs keep a shadow marker so stale *base* postings are ignored
+                // until flush. Clearing that marker without first purging those stale
+                // postings would resurrect old terms (Python update+flush tests).
+                let docs_to_purge: Vec<u64> = {
+                    let shadowed = self.shadowed_docs.read();
+                    if shadowed.is_empty() {
+                        Vec::new()
+                    } else {
+                        let mut ids = FastBitmap::new();
+                        for (_, bitmap) in &entries {
+                            for doc_id in bitmap.iter() {
+                                if shadowed.contains(doc_id) {
+                                    ids.add(doc_id);
+                                }
+                            }
+                        }
+                        ids.iter().collect()
+                    }
+                };
+                if !docs_to_purge.is_empty() {
+                    index
+                        .compact_with_deletions(&docs_to_purge)
+                        .map_err(|e| EngineError::IndexError(e.to_string()))?;
+                }
+
                 // Clean shadow markers for all flushed documents: their latest content is
-                // now in the base index, so base postings are trustworthy again.
+                // now (about to be) in the base index, so base postings are trustworthy.
                 {
                     let mut shadowed = self.shadowed_docs.write();
                     if !shadowed.is_empty() {
@@ -1263,6 +1288,30 @@ impl UnifiedEngine {
             }
 
             self.result_cache.clear();
+
+            // Same purge-before-clear-shadow as [`flush`]: otherwise stale base terms
+            // for updated docs become visible again once the shadow marker is dropped.
+            let docs_to_purge: Vec<u64> = {
+                let shadowed = self.shadowed_docs.read();
+                if shadowed.is_empty() {
+                    Vec::new()
+                } else {
+                    let mut ids = FastBitmap::new();
+                    for (_, bitmap) in &entries {
+                        for doc_id in bitmap.iter() {
+                            if shadowed.contains(doc_id) {
+                                ids.add(doc_id);
+                            }
+                        }
+                    }
+                    ids.iter().collect()
+                }
+            };
+            if !docs_to_purge.is_empty() {
+                index
+                    .compact_with_deletions(&docs_to_purge)
+                    .map_err(|e| EngineError::IndexError(e.to_string()))?;
+            }
 
             // Pre-clean shadow markers for all flushed documents: their latest content is
             // about to become part of the base index (via merge_into_data below).

@@ -36,7 +36,7 @@ except ImportError:
     )
 
 
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 
 
 class UnifiedEngine(_UnifiedEngine):

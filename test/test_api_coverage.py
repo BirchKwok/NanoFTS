@@ -734,7 +734,7 @@ class TestResultHandleMethods:
         arr = result.to_numpy()
         
         assert isinstance(arr, np.ndarray)
-        assert arr.dtype == np.uint32
+        assert arr.dtype == np.uint64
         assert len(arr) == 5
     
     def test_page(self, engine):

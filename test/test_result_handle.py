@@ -149,7 +149,7 @@ class TestResultHandleConversion:
         arr = result.to_numpy()
         
         assert isinstance(arr, np.ndarray)
-        assert arr.dtype == np.uint32
+        assert arr.dtype == np.uint64
         assert len(arr) == 4
         assert set(arr) == {0, 1, 2, 6}
 

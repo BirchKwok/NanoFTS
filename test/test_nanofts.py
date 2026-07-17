@@ -378,7 +378,7 @@ def test_numpy_support(engine, test_data):
     arr = result.to_numpy()
     
     assert isinstance(arr, np.ndarray)
-    assert arr.dtype == np.uint32
+    assert arr.dtype == np.uint64
 
 
 def test_stats(engine, test_data):

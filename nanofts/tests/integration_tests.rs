@@ -188,6 +188,14 @@ fn test_update_after_flush_returns_new_content_not_old() {
     let result = engine.search("original").unwrap();
     assert_eq!(result.total_hits(), 0, "stale base postings for the updated doc must be shadowed");
 
+    // Flush must purge stale base terms before clearing the shadow marker.
+    engine.flush().unwrap();
+    let result = engine.search("original").unwrap();
+    assert_eq!(result.total_hits(), 0, "after flush, old terms must be gone from the base index");
+    let result = engine.search("updated").unwrap();
+    assert_eq!(result.total_hits(), 1);
+    assert!(result.contains(1));
+
     // Clean up
     drop(engine);
     let _ = std::fs::remove_file(&index_path);
