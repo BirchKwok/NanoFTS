@@ -91,11 +91,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let final_path = dir.path().join("final.dat");
         let tmp_path = dir.path().join("final.dat.tmp");
-        fs::write(&tmp_path, b"new").unwrap();
         {
-            let f = File::open(&tmp_path).unwrap();
+            let mut f = File::create(&tmp_path).unwrap();
+            f.write_all(b"new").unwrap();
             f.sync_all().unwrap();
         }
+        // Pre-create destination so Windows takes the remove-then-rename path.
+        fs::write(&final_path, b"old").unwrap();
         durable_rename(&tmp_path, &final_path).unwrap();
         assert_eq!(fs::read(&final_path).unwrap(), b"new");
         assert!(!tmp_path.exists());
