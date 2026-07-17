@@ -4,26 +4,47 @@
 //! 1. Write payload to a temporary file
 //! 2. `sync_all` the temp file (data + metadata)
 //! 3. Atomically `rename` temp → final
-//! 4. `sync_all` the parent directory so the rename itself is durable
+//! 4. On Unix, `sync_all` the parent directory so the rename itself is durable
+//!    (Windows does not expose a portable directory fsync; NTFS rename is atomic
+//!    within a volume, so we skip this step there).
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
 
 /// Sync the parent directory of `path` so a preceding rename is durable.
+///
+/// On Windows this is a no-op: opening a directory handle and calling `sync_all`
+/// returns `ERROR_ACCESS_DENIED` (5) on typical runners and developer machines.
 pub fn sync_parent_dir(path: &Path) -> io::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    // On some platforms opening "." works; empty parent means current dir.
-    let dir = if parent.as_os_str().is_empty() {
-        File::open(".")?
-    } else {
-        File::open(parent)?
-    };
-    dir.sync_all()
+    #[cfg(unix)]
+    {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let dir = if parent.as_os_str().is_empty() {
+            File::open(".")?
+        } else {
+            File::open(parent)?
+        };
+        dir.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
 /// Atomically replace `final_path` with `tmp_path`, then fsync the parent directory.
+///
+/// On Windows, `rename` cannot overwrite an existing destination, so we remove
+/// `final_path` first when it already exists (same volume, best-effort atomicity).
 pub fn durable_rename(tmp_path: &Path, final_path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        if final_path.exists() {
+            fs::remove_file(final_path)?;
+        }
+    }
     fs::rename(tmp_path, final_path)?;
     sync_parent_dir(final_path)?;
     Ok(())
