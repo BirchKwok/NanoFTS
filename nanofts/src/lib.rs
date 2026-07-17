@@ -59,9 +59,13 @@
 //!
 //! - `python` - Enable Python bindings via PyO3 (disabled by default)
 //! - `simd` - Enable SIMD acceleration (requires nightly)
-//! - `mimalloc` - Use mimalloc allocator (enabled by default)
+//! - `mimalloc` - Use mimalloc allocator (enabled by default for native builds;
+//!   intentionally disabled when the `python` feature is on — a process-wide
+//!   allocator override in a PyO3 extension deadlocks/crashes with pandas /
+//!   numpy / pyarrow on macOS)
 
-#[cfg(feature = "mimalloc")]
+// Never install a process-wide allocator inside the Python extension module.
+#[cfg(all(feature = "mimalloc", not(feature = "python")))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

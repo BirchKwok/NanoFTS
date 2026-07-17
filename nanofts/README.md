@@ -71,12 +71,12 @@ Add this to your project `Cargo.toml`:
 
 ```toml
 [dependencies]
-nanofts = "0.8.2"
+nanofts = "0.8.3"
 ```
 
 Optional features:
 
-- **`mimalloc`**: enabled by default; lower latency / more stable allocation performance
+- **`mimalloc`**: enabled by default for native Rust builds; **not** used in Python wheels (a process-wide allocator in the extension deadlocks with pandas/numpy/pyarrow on macOS)
 - **`python`**: enable PyO3/Numpy bindings (only needed if you build the Python extension)
 - **`simd`**: enable SIMD acceleration (requires nightly and `packed_simd_2`)
 

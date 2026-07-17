@@ -40,7 +40,7 @@ jobs:
       - name: Run Rust tests with Python feature
         run: |
           cd nanofts
-          cargo test --features python --verbose
+          cargo test --no-default-features --features python --verbose
 
       - name: Check Rust formatting
         run: |
@@ -93,14 +93,16 @@ jobs:
       - name: Install Python test dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pytest maturin pandas polars pyarrow
+          python -m pip install pytest pytest-timeout maturin pandas polars pyarrow
 
       - name: Build and install package (Unix)
         if: runner.os != 'Windows'
         run: |
           cp README.md nanofts/README.md
           cd nanofts
-          maturin build --release --features python --out dist
+          # Python wheels must not ship mimalloc as #[global_allocator] — it
+          # deadlocks with pandas/numpy/pyarrow on macOS (hangs at first import).
+          maturin build --release --no-default-features --features python --out dist
           pip install dist/*.whl
 
       - name: Build and install package (Windows)
@@ -108,12 +110,19 @@ jobs:
         run: |
           copy README.md nanofts\README.md
           cd nanofts
-          maturin build --release --features python --out dist
+          maturin build --release --no-default-features --features python --out dist
           pip install (Get-ChildItem dist\*.whl).FullName
         shell: pwsh
 
       - name: Run Python tests
-        run: python -m pytest test/ -v
+        env:
+          # Keep BLAS single-threaded; avoids secondary hangs next to native code.
+          OMP_NUM_THREADS: "1"
+          OPENBLAS_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          VECLIB_MAXIMUM_THREADS: "1"
+          NUMEXPR_NUM_THREADS: "1"
+        run: python -m pytest test/ -v --timeout=120
         
     continue-on-error: ${{ contains(matrix.python, 'dev') }}
 
@@ -166,7 +175,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: x86_64
-          args: --release --features python --out dist
+          args: --release --no-default-features --features python --out dist
           manylinux: auto
           working-directory: nanofts
 
@@ -195,7 +204,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: aarch64-apple-darwin
-          args: --release --features python --out dist
+          args: --release --no-default-features --features python --out dist
           working-directory: nanofts
 
       - name: Upload wheels
@@ -227,7 +236,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --features python --out dist
+          args: --release --no-default-features --features python --out dist
           working-directory: nanofts
 
       - name: Upload wheels
